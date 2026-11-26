@@ -49,9 +49,14 @@ each object:
 
 `--include` chooses the fields after `path` instead, from `kind`, `size`,
 `mtime`, `s3_last_modified`, `etag`, `mode`, `uid`, `gid`, `ctime` and
-`link_target`. An entry without a field, such as a directory's `size`, leaves
-it out. JSON can only hold UTF-8 text, so a name that isn't valid UTF-8 fails
-`--json`; `--null` and the other forms print it unchanged.
+`link_target`. `s3_last_modified` and `etag` apply only to S3, and `ctime` and
+`link_target` apply only to filesystems; requesting another endpoint's field is
+an error. An entry without a selected field, such as a directory's `size`,
+leaves it out. On S3, passing `--include kind` checks each object's stored kind
+(distinguishing symlinks from regular files), whereas the default `--json`
+fields read only the listing. JSON can only hold UTF-8 text, so a name that
+isn't valid UTF-8 fails `--json`; `--null` and the other forms print it
+unchanged.
 
 ## Filtering
 

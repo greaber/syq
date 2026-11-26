@@ -144,13 +144,10 @@ A restricted receiver's own records have no `src`, `attempts`, or
 `retryable`, and a deletion has no `kind`. A file it didn't finish is `failed`,
 and a change it refused is `failed` with `class: "safety_limit"`. A request
 the receiver refuses, for example one that would go over its limits, is
-refused as a whole, with a record for every change in it. syq can then send
-some of those changes again one at a time, so a file with such a record may
-still have been completed, and a file refused again has a second record. The
-terminal `result` says the copy was refused. Under `--copy-metadata=hardlinks`
-(`-H`), every name of a multiply linked file counts even when nothing changes:
-the receiver checks the first and links each other name again. Allow for those
-when choosing the limit for a retry.
+refused as a whole, with a record for every change in it. Syq can then resend
+some of those changes individually, so a file with such a record may still
+succeed, or appear a second time if refused again; the terminal `result` says
+the copy was refused.
 
 Unchanged and excluded entries appear only in totals, and a live run emits no
 record for a metadata-only update. A parent directory that syq failed to

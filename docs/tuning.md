@@ -72,46 +72,11 @@ ceilings, pass the same keys to `--resource-limits` instead. Part size grows
 when needed to stay within S3's limit of 10,000 parts per upload. For retries,
 see [`--s3-retries`](object-storage.md#retries).
 
-Unless you fix it, syq adjusts the number of requests in flight as the copy
-goes. Each copy starts with a number that suits its objects and endpoint, but
-never more than a ceiling set with `--resource-limits` or what memory and the
-open-file limit allow:
-
-- files of up to a megabyte each, uploaded to a distant endpoint (one that
-  takes 20 ms or more to answer a listing or metadata request), start with as
-  many requests as memory and the open-file limit allow, up to 4,096, or at
-  most 2,048 when the endpoint answers within about 30 ms, unless every file
-  is exactly a megabyte;
-- other objects averaging under a megabyte, to or from a distant endpoint,
-  start with 256, and syq adds requests an eighth at a time rather than
-  doubling them, since each download in flight holds its response;
-- objects averaging a megabyte or more (including files of exactly a
-  megabyte) that each take one request start with 32;
-- anything else starts with 64.
-
-Uploads to Tigris start as they would to a nearby endpoint.
-
-From there, syq doubles the requests while the added ones bring at least half
-their share of the speed, so that each doubling speeds the copy up by about
-40% or more. Once they bring less, it goes back to what the measured speed
-needs, then keeps adjusting by an eighth at a time in either direction. When
-the service asks syq to slow down (HTTP 429 or 503), the number halves as
-soon as that answer arrives, even while the request is still being retried,
-and then grows back by an eighth at a time. Answers to requests sent before a
-halving, and to their retries, are taken as part of the same complaint while
-any of those requests is still in flight, for up to 30 seconds, so a burst of
-them halves the number once.
-
-The number of objects in progress follows the requests, at up to twice as
-many. When each object takes one request, that is within what memory and the
-open-file limit allow, but files to upload averaging up to 8 MiB, which syq
-keeps in memory from hashing them to sending them, get ready ahead of their
-requests only as far as its 256 MiB of upload buffers hold them. A batch with
-objects sent in parts keeps at most 32 in progress, or 256 when most of it is
-small objects, since their parts keep the requests busy. Checking whether an
-object needs copying takes a request, as a transfer does, so a copy that
-finds most objects up to date checks many at once, and `s3-requests` bounds
-checks and transfers together.
+Unless you fix it, syq adjusts S3 concurrency automatically within any
+`--resource-limits` ceiling and what memory and the open-file limit allow,
+backing off when the service throttles requests (HTTP 429 or 503). Checking
+whether an object needs copying takes a request alongside transfers, so
+`s3-requests` bounds checks and transfers together.
 
 <a id="s3-streams"></a>
 
@@ -128,11 +93,12 @@ pruning. Filesystem pruning always tunes its own workers.
 
 `syq find` and `syq ls` send up to 32 S3 listing requests at a time. Use
 `--performance-tuning s3-requests=N` to change that (1–256; larger values
-count as 256). With `s3-requests=1`, `syq find` without a depth lists one
-request at a time without dividing a listing or probing ignored
-subdirectories, and a listing narrowed by a `path` condition starts over on
-the full prefix if that narrower request is refused before anything prints.
-Filesystem listings have no tuning keys.
+count as 256); per-object HEAD requests are not affected. With `s3-requests=1`,
+`syq find` without a depth lists one request at a time without splitting a
+prefix into narrower requests, which avoids failing under bucket policies that
+allow listing only the requested prefix (a listing narrowed by a `path`
+condition still falls back to the full prefix if that narrower request is
+refused before anything prints). Filesystem listings have no tuning keys.
 
 ## Remembered connection counts
 
@@ -162,19 +128,11 @@ records can change between versions and are not part of the
 remembered counts. When a server coordinates a copy, the history is on that
 server; S3 copies record none.
 
-A small push completed on the control connection has no tuning timeline.
-Successful empty and single-file copies that finish before their first
-measurement also skip the final write unless syq changed the worker count,
-recorded TCP diagnostics, or already saved part of the timeline. Other copies
-save their timeline when they end. A copy that runs for more than a second
-also saves it every few seconds along the way. It is listed as `incomplete`
-until it ends, and stays that way, with what it had saved, if it is
-interrupted. A copy interrupted in its first second leaves no record.
-Recording does not hold a copy up for long: when many copies end at the same
-moment, a copy waits for the others no longer than it ran itself, and never
-more than a tenth of a second. Then it gives up: a copy that had saved nothing
-yet leaves no record, which mostly happens to very short copies, and a longer
-one stays `incomplete`.
+Very short copies—such as empty, single-file, or small control-connection
+copies—often leave no record. Copies that run longer save progress periodically
+and appear as `incomplete` until they finish (or if they are interrupted); a
+copy interrupted right away leaves no record. When many copies finish at the
+same time, a copy may skip saving rather than wait on the history file.
 
 The history holds opaque endpoint, filesystem, and network-address
 identifiers, the UTC date, copy settings, progress numbers, and tuning

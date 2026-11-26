@@ -109,8 +109,10 @@ file data by default; change these for one copy with
 changes the copy asks hostB to make: files written, directories, links and
 special files created, metadata changes, and deletions. Each counts when hostB
 accepts the request for it, even if hostB then finds nothing to change, and
-one sent again after a dropped connection counts again. The copy must start
-within 24 hours of authorization and finish within seven days of it.
+one sent again after a dropped connection counts again; under
+`--copy-metadata=hardlinks` (`-H`), every name of a multiply linked file counts
+even when nothing changes. The copy must start within 24 hours of authorization
+and finish within seven days of it.
 
 A copy between two servers can name up to 1,024 sources, like any copy, but
 long paths lower that number. A restricted copy's signed command holds at most
@@ -132,15 +134,12 @@ except into its SSH configuration or syq's own programs and state.
 `--widen-dirs all` widens nothing above the destination's parent directory,
 and can't be combined with `--follow-dst` and `--into`.
 
-With `--if-exists=keep`, a restricted copy replaces none of the files and
-directories it finds in the destination on hostB and changes the metadata of
-none of them, not even a directory's permissions for a moment. So
-`--widen-dirs` does not widen the existing directories the copy includes. Syq
-names each one that lacks the owner permission a change needs, and says why
-with the first; those changes fail one by one, and everything else is copied.
-`--widen-dirs all` still briefly widens the directory the copy goes into and
-the directory that holds the destination, which it may need to reach the
-destination or to create it, as in any restricted copy.
+With `--if-exists=keep`, a restricted copy leaves existing destination files,
+directories, and their metadata untouched, so `--widen-dirs` does not widen
+existing directories included in the copy: changes needing owner permissions
+there fail while other entries still copy. `--widen-dirs all` still briefly
+widens the destination directory itself and its parent when needed to reach or
+create it.
 
 <a id="signed-results"></a>
 

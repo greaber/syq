@@ -43,20 +43,9 @@ service is back.
 ### Listing large prefixes
 
 Before copying or removing a prefix, for `--prune`, and for `syq find` without
-`--depth`, syq lists the keys under it. When a listing spans multiple pages and
-the prefix has subdirectories, syq may split it into parallel listings, trading
-extra list requests (typically up to about a quarter more on large trees) for
-lower latency.
-
-In general-purpose AWS S3 buckets, keys arrive in byte order, so syq can split
-by key range as well as by subdirectory. With `--s3-endpoint`, key-range
-splitting applies only to recognized AWS S3 endpoints (regional, dual-stack,
-FIPS, or VPC bucket endpoints). Other services (such as Cloudflare R2, Google
-Cloud Storage, Backblaze B2, Tigris, and MinIO) and S3 Express directory
-buckets and their access points (`--x-s3` and `--xa-s3`) do not guarantee byte
-order, so syq splits there only by subdirectory and falls back to sequential
-listing when a prefix is flat or when the service does not return all
-subdirectories in one complete response.
+`--depth`, syq lists the keys under it. On large prefixes, syq may divide the
+work into parallel listings, trading extra list requests (typically up to about
+a quarter more on large trees) for lower latency.
 
 When a bucket policy allows listing only the requested prefix and denies
 narrower prefixes, copies and removals fall back to a sequential listing.
@@ -109,27 +98,24 @@ Listing needs only permission to list the bucket (`s3:ListBucket`).
 request for each thousand entries. `syq find` without a depth lists every key
 under the prefix, dividing the work as copies do (see
 [Listing large prefixes](#listing-large-prefixes)). A `path glob` or `path =`
-condition joined to the rest of `--where` with `and` limits the requests to
-the prefixes that can hold a match, such as `laptop/photos/2026-*/` rather
-than all of `laptop/`, unless a condition before it could fail, such as
-arithmetic on a field or checking stored object metadata like `mtime`. When syq can determine that `--where` rules out every directory, recursive
-`syq find` also skips building virtual directories and skips subtrees a `path`
-pattern cannot match instead of listing everything under the prefix (when a
-wildcard matches more than a page of subdirectories, syq still lists under
-that prefix). On S3 directory buckets whose names end with `--x-s3` or
-`--xa-s3`, `syq ls` and `--depth` can also show a prefix that holds only an
-in-progress multipart upload.
+condition joined to the rest of `--where` with `and` limits requests to the
+prefixes that can hold a match, such as `laptop/photos/2026-*/` rather than all
+of `laptop/`, unless an earlier condition could fail (such as arithmetic on a
+field or reading stored object metadata like `mtime`). When `--where` rules out
+directories, a `path` pattern can also skip unmatched subtrees in a recursive
+listing. On S3 directory buckets (`--x-s3` and `--xa-s3`), `syq ls` and
+`--depth` can also show a prefix that holds only an in-progress multipart
+upload.
 
 Conditions on `path`, `name`, `extension`, `size`, `s3_last_modified`, a
 directory's `kind`, and whether `kind` is `"dir"` use the listing alone. Other
 fields of an object, including whether it is a file or a symlink that syq
 stored, need a HEAD request for each object the listed fields haven't ruled
-out, as do `--include` `kind`, `mtime`, `mode`, `uid` and `gid`; syq sends up
-to 32 at a time. `--long` and the default `--json` fields do not need a HEAD request on their
-own; without one, objects (including symlinks) print as files and directory
-markers as directories. Without
-`--s3-region`, syq also asks AWS where the bucket is, with one HEAD request
-for the bucket itself.
+out, as do `--include` `kind`, `mtime`, `mode`, `uid` and `gid`; syq sends
+those requests in parallel. `--long` and the default `--json` fields do not
+need a HEAD request on their own; without one, objects (including symlinks)
+print as files and directory markers as directories. Without `--s3-region`, syq
+also asks AWS where the bucket is, with one HEAD request for the bucket itself.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
@@ -220,15 +206,12 @@ syq cp --from s3://bucket --srcs-in dataset --to server --into dataset
 
 The copy runs on the server, and file data travels directly between the
 server and the storage service, never through the machine where you typed the
-command. That machine supplies the credentials: `--s3-profile`,
-`--s3-endpoint`, `--s3-region` and the AWS environment variables are read
-there, and it signs each storage request the server needs, so the server needs
-no credentials and never receives yours. Typing the command is the approval;
-there is no prompt. It signs only for the bucket, paths and operations the
-command implies: for a source you name, such as `project` with
-`--into backups`, that is `backups/project` and what lies under it. See
-[Storage authorization](security.md#storage-authorization) for the limits and
-for what this trusts the server with.
+command. That machine reads `--s3-profile`, `--s3-endpoint`, `--s3-region`,
+and the AWS environment variables, and signs each storage request the server
+needs, so the server never receives your credentials. Typing the command is the
+approval; there is no prompt. It signs only the bucket, paths, and operations
+the command implies; see [Storage authorization](security.md#storage-authorization)
+for the exact scope and limits.
 
 When the storage credentials are on a third machine, add `--auth-from @NAME`
 to have that [receiving machine](receive.md#set-up-receiving) approve the copy
@@ -239,50 +222,41 @@ syq cp --from server project --to s3://bucket --into backups \
   --auth-from @laptop --s3-profile storage
 ```
 
-You approve the request on NAME, as for
-[any storage authorization](#authorize-from-your-laptop), and
-`--s3-profile` selects a profile there. The machine where you typed the
-command only passes signing requests and signed URLs between the server and
-NAME; it needs no storage credentials, and it still logs in to the server
-with its own SSH access. Once syq reports **storage authorization ready**,
-NAME may disconnect.
+You approve the request on `NAME`, as for
+[any storage authorization](#authorize-from-your-laptop), and `--s3-profile`
+selects a profile there. The machine where you typed the command needs no
+storage credentials; it logs in to the server with its own SSH access and
+relays signing requests and signed URLs between the server and `NAME`. Once syq
+reports **storage authorization ready**, `NAME` may disconnect.
 
-The server needs:
-
-- network access to the storage service, and for HTTPS the usual
-  [CA certificates](security.md#https-certificates);
-- a clock that is roughly right;
-- the same syq build as your machine, which syq installs for you as for any
-  copy to a server.
+The server needs network access to the storage service (with the usual
+[CA certificates](security.md#https-certificates) for HTTPS), a roughly right
+clock, and the same syq build as your machine, which syq installs for you as
+for any copy to a server.
 
 `--dry-run`, `--results`, `-v`, progress and exit codes work as they do for a
 copy run on the server itself. Keep the command running: if it ends or loses
 its connection, the copy on the server stops. Run it again to continue; the
 server keeps the records of interrupted uploads and downloads, and your
-machine signs again.
+machine signs again. Signed requests last up to seven days, or until the
+signing credentials expire if sooner (syq says when); a copy that runs longer
+fails its remaining files and can be rerun.
 
-Requests are signed before data starts moving and stay valid for seven days,
-as for any storage authorization, or until the signing credentials expire if
-that is sooner, as temporary credentials often do within an hour; syq then
-says when. A copy that runs longer fails its remaining files; run it again to
-continue.
-
-Headers you add with `--s3-header` and `--s3-write-header` are sent to the
-server, which makes the requests. A customer-provided encryption key would be
-sent with them, so these copies refuse the
-`x-amz-server-side-encryption-customer-*` headers; to copy with such a key,
-run syq on the server.
+Headers added with `--s3-header` and `--s3-write-header` are sent to the
+server, so customer-provided encryption key headers
+(`x-amz-server-side-encryption-customer-*`) are refused; run syq on the server
+to copy with such a key.
 
 These copies do not support `--detach`, `--mapping`,
-`--stream-mapping-fd` or the options for copies between two servers
-(`--coordinate-at`, `--peer-auth` and the TCP options). `syq rm`, copies between two buckets and
-copies that also name a second server or a receiving machine (`@NAME`) cannot
-run through a server this way.
+[stream mappings](stream-mappings.md), or the options for copies between two
+servers (`--coordinate-at`, `--peer-auth`, and the TCP options). `syq rm`,
+copies between two buckets, and copies that also name a second server or a
+receiving machine (`@NAME`) cannot run through a server this way.
 
 ## Authorize from your laptop
 
-Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
-connected [receiving machine](receive.md#set-up-receiving).
+Add `--auth-from @NAME` to an S3 `cp` or `rm` command on a server to use
+credentials on a connected [receiving machine](receive.md#set-up-receiving).
 `--s3-profile` selects a profile there:
 
 ```sh
@@ -291,13 +265,12 @@ syq cp results --to s3://my-bucket --into runs \
 ```
 
 Approve on your laptop, then wait for **storage authorization ready** before
-disconnecting. The prompt lists the paths the command covers: for a source
-you name, its own name inside the destination, and otherwise the whole
-destination path. Data travels directly between the server and storage.
-Authorization lasts up to seven days, subject to credentials and provider
-policies; restarting requires fresh approval. Both machines need the same syq
-build. See [Storage authorization](security.md#storage-authorization) for the
-security implications.
+disconnecting. The prompt lists the paths the command covers; data travels
+directly between the server and storage. Authorization lasts up to seven days,
+subject to credentials and provider policies; restarting requires fresh
+approval. Both machines need the same syq build. See
+[Storage authorization](security.md#storage-authorization) for the scope rules
+and security implications.
 
 <a id="shell-pipelines"></a>
 

@@ -159,16 +159,14 @@ cannot substitute code. This relies on the release signing key, your installed
 syq, and the SSH accounts involved staying trustworthy.
 
 Syq downloads official executables, served through `dl.syq.christmas`, for
-self-updates, `--use-version`, and helpers on SSH servers, and checks each
-against the size and SHA-256 hash the signed manifest lists. Releases also
-offer smaller zstd archives, which a second signed manifest lists; syq
-downloads those when a release has them, and SSH servers do when they have
-`zstd`. Source builds also carry the release key for `--use-version`. When an
-SSH server downloads its own helper, your machine checks the manifests and the
-archive hash the server reports before allowing installation, and the server
-checks the unpacked helper's size and hash from the signed manifest before
-running it. If either check fails, or the download cannot be verified, syq
-uploads a verified helper over SSH instead.
+self-updates, `--use-version`, and helpers on SSH servers, and verifies each
+downloaded archive and the executable it unpacks to against the sizes and
+SHA-256 hashes in the signed release manifests. Source builds also carry the
+release key for `--use-version`. When an SSH server downloads its own helper,
+your machine checks the manifests and the archive hash the server reports
+before allowing installation, and the server checks the unpacked helper's size
+and hash from the signed manifest before running it. If either check fails, or
+the download cannot be verified, syq uploads a verified helper over SSH instead.
 
 A release you select with `--use-version` is verified once, when syq stores it
 in `~/.local/lib/syq`. Later runs on your machine start it without hashing it
@@ -179,11 +177,10 @@ anyone who can write `~/.local/bin` can replace syq, so keep them writable only
 by you. On SSH servers, syq starts the stored helper without these checks, so
 keep `~/.local/lib/syq` there writable only by you too.
 
-Your first installation establishes this trust. The standalone installer
-downloads the zstd archive when `zstd` is installed, and gzip otherwise. It
-checks the archive, and the executable it unpacks to before running it, against
-sizes and SHA-256 hashes embedded in the script, but not the release signature,
-so you trust the script you fetched over HTTPS.
+Your first installation establishes this trust. The standalone installer checks
+both the downloaded archive and the unpacked executable against sizes and
+SHA-256 hashes embedded in the script, but not the release signature, so you
+trust the script you fetched over HTTPS.
 Homebrew installations trust Homebrew and the tap. A source build is trusted
 as built, and by default syq uploads that executable as its helper on
 servers. See [Install](install.md) for the installation methods.
@@ -572,15 +569,15 @@ destination.
 ### Storage authorization
 
 [Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
-server signed URLs for the approved paths and operations, while the secret
-access key stays on your laptop. Within the authorizing credentials'
-permissions, approval trusts the server to choose uploaded contents and object
-settings, such as tags or Object Lock retention, because some services accept
-request headers that a signature does not cover. Anyone with the URLs can
-reuse them until they expire; stopping receiving does not revoke them. The
-protections for filesystem copies do not apply: receiving roots, the
-receiving machine's own byte, entry, and deletion limits, and single-use
-signed copies.
+server signed URLs for the approved paths and operations while keeping the
+secret access key on the signing machine. This is narrower than forwarding
+credentials to the server, which would grant everything those credentials allow
+for as long as they last. Within the signing credentials' permissions, however,
+approval trusts the server to choose uploaded contents and object settings such
+as tags or Object Lock retention, because some services accept request headers
+that a signature does not cover. The protections for filesystem copies do not
+apply: receiving roots, the receiving machine's own byte, entry, and deletion
+limits, and single-use signed copies.
 
 The machine that signs works out what to allow from the command alone, and
 signs nothing else:
@@ -591,67 +588,52 @@ signs nothing else:
   inside the destination and everything under it: `syq cp project --to
   s3://bucket --into backups` covers `backups/project`, not the rest of
   `backups`, and with no placement option it covers `project`, not the rest
-  of the bucket. The prompt lists these paths. An upload covers the whole
-  destination path instead when the command does not fix the names: with
-  `--srcs-in`, whose names come from the directory's contents, with
-  `--mapping`, with `--into-existing` or `--into-new`, which look at the
-  destination directory itself, and with more than 1024 named sources (a copy
-  between a server and a bucket refuses that many instead). A copy between
-  two buckets covers each source in the source bucket and the whole
+  of the bucket. An upload covers the whole destination path instead when the
+  command does not fix the names: with `--srcs-in`, `--mapping`,
+  `--into-existing`, or `--into-new`, and with more than 1,024 named sources
+  (a copy between a server and a bucket refuses that many instead). A copy
+  between two buckets covers each source in the source bucket and the whole
   destination path.
 - **The operations.** A download can only read. An upload can also write. It
   can delete only with `--prune` or `--prune-before`, and then no more objects
   than `--max-delete` allows: the signing machine counts the deletions it
   signs and refuses the rest. With `--dry-run` it can only read.
 
-Some things the signing machine cannot check, because it does not see the
-files being copied. `--where`, `--ignore` and `--copy-if` choose among the
-server's files, so they shape what an honest server does and do not narrow
-what is signed: a compromised server can read, replace or, with pruning,
-delete any object under the covered paths, up to the deletion limit. It also
-chooses the contents it uploads. Name a destination used for nothing else
-when that matters.
+Because the signing machine does not see the server's files, `--where`,
+`--ignore`, and `--copy-if` do not narrow what is signed: a compromised server
+can read, replace, or (with pruning) delete any object under the covered paths
+up to `--max-delete`, and choose the uploaded contents. Name a destination used
+for nothing else when that matters.
 
-Upload approval is not a write-only grant. It includes reading object
-contents and metadata within the covered paths, to compare with existing
-files. When updates are allowed, it also permits reading destination
-tags, updating tags on the current destination object, and copying an object
-onto itself to update metadata. It does not authorize tag changes on older
-versions or copying a different destination object as the source;
-bucket-to-bucket copies need a separately approved source.
+Upload approval is not a write-only grant. It includes reading object contents
+and metadata within the covered paths to compare with existing files. When
+updates are allowed, it also permits reading and updating tags on the current
+destination object and copying an object onto itself to update metadata, but
+not changing tags on older versions or copying another destination object as
+the source (bucket-to-bucket copies need a separately approved source).
 
 A [copy between a server and a bucket](object-storage.md#copy-between-a-server-and-a-bucket)
-that you start from another machine gives the server signed URLs in the same
-way, within the same limits. Who signs depends on the command:
+started from another machine uses the same signed URLs and limits:
 
-- **Without `--auth-from`, the machine where you type the command signs, and
-  there is no prompt.** Typing the command is the approval. That machine works
-  out the limits above before it contacts the server, and refuses any request
-  outside them, which ends the copy. syq says so when that machine's
-  credentials expire before the URLs would.
-- **With `--auth-from @NAME`, the receiving machine NAME signs, after you
-  approve its prompt.** It checks the command and shows the same request as
-  for any storage authorization. The
-  machine where you typed the command holds no storage credentials: it passes
-  the server's signing requests to NAME and the signed URLs back, so it sees
-  those URLs as the server does, and passes nothing else. The option chooses who signs for storage only;
-  the login to the server uses the typing machine's own SSH access.
+- **Without `--auth-from`**, the machine where you type the command signs with
+  no prompt—typing the command is the approval—and refuses any request outside
+  those limits, which ends the copy.
+- **With `--auth-from @NAME`**, the receiving machine `NAME` approves and signs
+  as usual. The machine where you typed the command logs in to the server with
+  its own SSH access, holds no storage credentials, and relays only signing
+  requests and signed URLs between the server and `NAME` (so it sees those URLs
+  as the server does).
 
-Either way, the URLs last seven days, or until the signing credentials
-expire if that is sooner, and file data travels only between the server and
-the storage service. Values given with `--s3-header` and `--s3-write-header`
-are sent to the server, because it makes the requests. A customer-provided
-encryption key (the `x-amz-server-side-encryption-customer-*` headers) would
-be sent with them, so syq refuses such a copy; run syq on the server to copy
-with that key.
+Values given with `--s3-header` and `--s3-write-header` are sent to the server,
+so syq refuses customer-provided encryption key headers
+(`x-amz-server-side-encryption-customer-*`) on copies between a server and a
+bucket; run syq on the server to copy with such a key.
 
-A compromised server, or anyone who gets the URLs from it, can use them until
-they expire for anything inside the limits. Ending the command stops the copy
-but does not revoke URLs already signed; nothing can, short of revoking the
-credentials that signed them. The secret access key never leaves the machine
-that signs. This is narrower than forwarding credentials to the server, which
-would let it do anything those credentials allow, anywhere, for as long as
-they last.
+Signed URLs last up to seven days, or until the signing credentials expire if
+that is sooner. Anyone who obtains the URLs—including a compromised server—can
+reuse them within their limits until they expire. Ending the command or
+stopping receiving stops further signing, but nothing revokes URLs already
+signed short of revoking the credentials that signed them.
 
 ## SSH account access
 
