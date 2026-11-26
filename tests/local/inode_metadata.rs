@@ -1180,7 +1180,7 @@ fn files_from_reports_earlier_missing_path_before_later_source_stat_failure() {
     let denied = t.path("src/denied");
     write(&denied, b"data");
     set_attr(&denied, "user.test", b"value");
-    fs::set_permissions(&denied, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
     let list = format!(
         "{}missing\n{}denied\n",
         "ok\n".repeat(4096),
