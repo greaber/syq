@@ -406,7 +406,7 @@ fn remote_metadata_rerun_uses_early_lookups() {
     assert!(!early.lines().any(|line| line == "deferred"), "{early}");
 }
 
-fn files_from_copy_with(
+pub(super) fn files_from_copy_with(
     t: &Tmp,
     rsh: &Path,
     list: &Path,
@@ -462,6 +462,36 @@ fn files_from_explicit_list_uses_early_lookups_on_rerun() {
     assert!(sent >= 2, "{sent} lookups were sent early");
     assert_eq!((used, repeated, withdrawn, discarded), (sent, 0, 0, 0));
     assert_eq!(batch_lookups(&t), sent + 1);
+}
+
+/// Repeat each name to fill one 4,096-line chunk without needing thousands
+/// of files. Each chunk should yield exactly one lookup on an unchanged run.
+#[test]
+fn files_from_rerun_keeps_four_batch_replies_in_flight() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let mut list = String::new();
+    for i in 0..10 {
+        write(&t.path(&format!("src/f{i}")), b"data");
+        list.push_str(&format!("f{i}\n").repeat(4096));
+    }
+    write(&t.path("list"), list.as_bytes());
+    for _ in 0..2 {
+        assert_output_ok(&files_from_copy_with(&t, &rsh, &t.path("list"), &[], &[]));
+    }
+    let events = fs::read_to_string(t.path("early")).unwrap();
+    let mut pending = 0usize;
+    let mut peak = 0;
+    for event in events.lines() {
+        match event {
+            "sent 0 1" => pending += 1,
+            "used" => pending = pending.checked_sub(1).unwrap(),
+            other => panic!("unexpected lookup event {other}: {events}"),
+        }
+        peak = peak.max(pending);
+    }
+    assert_eq!((pending, peak), (0, 4), "{events}");
+    assert_eq!(batch_lookups(&t), 10);
 }
 
 #[test]

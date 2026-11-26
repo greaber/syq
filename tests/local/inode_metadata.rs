@@ -1160,3 +1160,38 @@ fn files_from_recursive_preserves_and_repairs_descendant_xattrs() {
         }
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn files_from_reports_earlier_missing_path_before_later_source_stat_failure() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/ok"), b"data");
+    write(&t.path("list"), b"ok\n");
+    let copy =
+        || super::early_lookups::files_from_copy_with(&t, &rsh, &t.path("list"), &["-X"], &[]);
+    assert_output_ok(&copy());
+
+    // The first unchanged chunk enables read-ahead. Preparing the third
+    // chunk fails because the source's user xattr can't be read.
+    let denied = t.path("src/denied");
+    write(&denied, b"data");
+    set_attr(&denied, "user.test", b"value");
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0)).unwrap();
+    let list = format!(
+        "{}missing\n{}denied\n",
+        "ok\n".repeat(4096),
+        "ok\n".repeat(4095)
+    );
+    write(&t.path("list"), list.as_bytes());
+    let output = copy();
+    assert!(!output.status.success());
+    let err = stderr_of(&output);
+    let (_, after_missing) = err
+        .split_once("missing: no such file or directory")
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(after_missing.contains("Permission denied"), "{err}");
+}
