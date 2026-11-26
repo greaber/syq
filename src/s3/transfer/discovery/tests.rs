@@ -385,17 +385,23 @@ async fn copies_that_do_not_list_presign_every_check() {
 
 /// The overwrite policies that check each key with HEAD unless the
 /// destination holds nothing.
-const HEAD_PER_KEY: [&[&str]; 6] = [
+const HEAD_PER_KEY: [&[&str]; 4] = [
     &["--if-exists=keep"],
     &["--only-existing"],
-    &["--if-exists=update-if-older"],
-    &["--copy-if", "not dst.exists or src.size != dst.size"],
     &["--if-exists=error-if-different"],
     &["--if-exists=error", "--dry-run"],
 ];
 
+/// The overwrite policies that check each key with HEAD however empty the
+/// destination looked: they would replace an object created since without
+/// judging it.
+const HEAD_ALWAYS: [&[&str]; 2] = [
+    &["--if-exists=update-if-older"],
+    &["--copy-if", "not dst.exists or src.size != dst.size"],
+];
+
 #[tokio::test]
-async fn an_empty_prefix_spares_every_policy_its_checks_beneath_it() {
+async fn an_empty_prefix_spares_policies_their_checks_beneath_it() {
     // A directory of files, a directory marker, and beside the prefix a
     // named file the request that showed it empty could not see.
     let mut plan: Vec<String> = (0..100).map(|f| format!("data/dir/f{f:03}")).collect();
@@ -437,6 +443,32 @@ async fn an_empty_prefix_spares_every_policy_its_checks_beneath_it() {
         presigned_under(&args, None, Some(""), None, &plan).await,
         Vec::<String>::new()
     );
+}
+
+#[tokio::test]
+async fn policies_that_judge_existing_objects_ignore_an_empty_prefix() {
+    let mut plan: Vec<String> = (0..100).map(|f| format!("data/dir/f{f:03}")).collect();
+    plan.push("data/dir/sub/".to_owned());
+    plan.sort();
+    for flags in HEAD_ALWAYS {
+        let args = cp(flags);
+        assert!(!trusts_empty_prefix(&args), "{flags:?}");
+        for empty in [Some("data/dir/"), Some("")] {
+            assert_eq!(
+                presigned_under(&args, None, empty, None, &plan).await,
+                plan,
+                "{flags:?} {empty:?}"
+            );
+        }
+        assert_eq!(
+            listed(&args, None, Some("data/dir/"), None, 0, "data/dir/f000").await,
+            Listed::Unknown,
+            "{flags:?}"
+        );
+    }
+    for flags in HEAD_PER_KEY {
+        assert!(trusts_empty_prefix(&cp(flags)), "{flags:?}");
+    }
 }
 
 #[tokio::test]
@@ -1815,25 +1847,6 @@ mod signed {
             requests[0].get("start-after"),
             Some(&predecessor("dst/a/01"))
         );
-    }
-
-    #[tokio::test]
-    async fn a_signed_upload_that_judges_existing_objects_ignores_an_empty_prefix() {
-        // Its signed requests do not include the HEAD and unconditional write
-        // an object created after the probe would need.
-        for (flags, signed, unsigned) in [
-            (&[][..], true, true),
-            (&["--if-exists=keep"], true, true),
-            (&["--if-exists=error-if-different"], true, true),
-            (&["--if-exists=update-if-older"], false, true),
-            (&["--copy-if", "not dst.exists"], false, true),
-        ] {
-            let argv = [ARGV, flags].concat();
-            for (signs, trusted) in [(true, signed), (false, unsigned)] {
-                let (engine, _) = engine(&argv, &served(), signs);
-                assert_eq!(engine.trusts_empty(), trusted, "{flags:?} {signs}");
-            }
-        }
     }
 
     /// Named directories `d00`…`d39` uploaded into `dst` with `--prune`, and

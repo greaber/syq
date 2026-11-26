@@ -10,10 +10,10 @@
 //! only some prefixes inside it: then it reads each of those for the planned
 //! keys beneath it ([`segments`]), several at once ([`LISTINGS`]).
 //!
-//! Copies whose overwrite policy needs each key's current metadata do not
-//! follow the plan this way. They still learn from one short request that a
-//! prefix holds nothing at all ([`shows_empty`]): every planned key beneath
-//! it is then absent, whatever order the store lists in.
+//! Some copies that do not follow the plan this way still learn from one
+//! short request that a prefix holds nothing at all ([`shows_empty`]): every
+//! planned key beneath it is then absent, whatever order the store lists in,
+//! where the policy may rely on that ([`trusts_empty_prefix`]).
 use super::super::authorization::Unsigned;
 use super::super::listing::{
     self,
@@ -40,8 +40,8 @@ use tokio::sync::watch;
 /// look absent, and an upload in its place would drop metadata only the
 /// destination has. Copies whose overwrite policy needs current metadata
 /// ask with HEAD before proceeding. Existence-only uploads can separately
-/// use a listing to rule out keys they would skip, and every policy relies on
-/// a prefix shown empty ([`shows_empty`]).
+/// use a listing to rule out keys they would skip, and most policies rely on
+/// a prefix shown empty ([`trusts_empty_prefix`]).
 pub(super) fn trusts_absence(args: &Args) -> bool {
     // The object would be skipped by --only-existing, refused instead of kept
     // by keep, overwritten though newer by update-if-older, and judged by
@@ -66,6 +66,20 @@ pub(super) fn trusts_absence(args: &Args) -> bool {
 /// `--if-exists=error`, where a write that must create it would be refused.
 pub(super) fn trusts_absence_of(args: &Args, key: &str) -> bool {
     args.existing || !(key.ends_with('/') && args.protects_existing_contents())
+}
+
+/// Whether a destination prefix shown empty when the copy started
+/// ([`shows_empty`]) may spare the planned keys beneath it their HEADs.
+/// Another writer can create one of those keys after the probe. Where the
+/// policy writes nothing (`--only-existing`, a dry run), writes a key it
+/// finds absent with `If-None-Match: *` (`--if-exists=keep`,
+/// `error-if-different`, `error`), or replaces whatever is there, that
+/// object meets the outcome it would meet if created between a HEAD and the
+/// write. `--if-exists=update-if-older` and `--copy-if` would replace it
+/// without judging it, so their keys keep their HEADs, which leave only the
+/// time from each HEAD to its write.
+pub(super) fn trusts_empty_prefix(args: &Args) -> bool {
+    !(args.update || args.expressions.update.is_some())
 }
 
 /// Planned keys beneath a prefix worth one request to learn that it is
@@ -933,11 +947,14 @@ fn trusts_listed_absence_of(args: &Args, key: &str) -> bool {
 }
 
 /// `key` is absent if it lies beneath `empty`, a prefix that held nothing
-/// when the copy started, and the policy may rely on its absence. A key
-/// outside it, such as a named file beside a signed prefix, is not decided.
+/// when the copy started, and the policy may rely on its absence
+/// ([`trusts_empty_prefix`]). A key outside it, such as a named file beside a
+/// signed prefix, is not decided.
 fn in_empty(args: &Args, empty: Option<&str>, key: &str) -> Option<Listed> {
     empty
-        .filter(|prefix| key.starts_with(prefix) && trusts_absence_of(args, key))
+        .filter(|prefix| {
+            key.starts_with(prefix) && trusts_empty_prefix(args) && trusts_absence_of(args, key)
+        })
         .map(|_| Listed::Absent)
 }
 

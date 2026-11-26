@@ -217,26 +217,9 @@ struct PreparedUpload {
     payload: Option<Payload>,
     metadata: Metadata,
     must_be_new: bool,
-    /// The copy skipped this key's HEAD because no object was there, but its
-    /// policy would not replace every object: the write is sent create-only,
-    /// and an object another writer created since is judged before it is
-    /// replaced (`Engine::judge_concurrent`).
-    guard_absence: bool,
     multipart: Option<PreparedMultipart>,
     metadata_update: Option<super::metadata_copy::Prepared>,
 }
-/// What a create-only write refused by an object already there does next.
-enum Concurrent {
-    /// The policy keeps that object.
-    Kept,
-    /// The policy replaces it: write again without the condition.
-    Replaced,
-    /// It is gone again: write create-only again.
-    Absent,
-}
-/// Create-only writes an upload sends for a key that keeps appearing and
-/// disappearing before it gives up.
-const CONCURRENT_ATTEMPTS: u32 = 3;
 /// What an upload request sends.
 #[derive(Clone)]
 enum Payload {
@@ -1142,29 +1125,19 @@ impl Engine {
         Ok(())
     }
     /// Whether a destination prefix shown empty when the copy started may
-    /// spare the keys beneath it their HEADs. Another writer can create one
-    /// of them later, and a write that may not replace such an object must
-    /// then be refused by a condition the store enforces.
-    ///
-    /// An upload's PUT or completion is sent create-only and judges an
-    /// object it is refused by (`guard_absence`); a signed upload sends only
-    /// the requests signed for it, which do not include that fallback. A
-    /// server-side copy's `If-None-Match` is not enforced by every store
-    /// (Cloudflare R2 takes its own header for CopyObject), so a copy that
-    /// writes and protects existing objects checks each key. Copies that
-    /// write nothing over a key they find absent still rely on it.
+    /// spare the keys beneath it their HEADs
+    /// ([`discovery::trusts_empty_prefix`]). A server-side copy's
+    /// `If-None-Match` is not enforced by every store (Cloudflare R2 takes its
+    /// own header for CopyObject), so a server-side copy that writes and
+    /// protects existing objects checks each key.
     fn trusts_empty(&self) -> bool {
         let args = &self.args;
-        let judges = args.update || args.expressions.update.is_some();
-        if self.options.route.is_server_copy() {
-            args.existing
+        discovery::trusts_empty_prefix(args)
+            && (!self.options.route.is_server_copy()
+                || args.existing
                 || args.dry_run
-                || !(judges
-                    || args.ignore_existing
-                    || args.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent))
-        } else {
-            args.existing || self.authorization.is_none() || !judges
-        }
+                || !(args.ignore_existing
+                    || args.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
     }
     /// The result of a listing the copy can do without: its failure leaves
     /// each key to its HEAD. A wrong region still gets the normal diagnostic.
@@ -1382,7 +1355,6 @@ impl Engine {
             payload: None,
             metadata,
             must_be_new: false,
-            guard_absence: false,
             multipart: None,
             metadata_update: Some(update),
         })))
@@ -1418,7 +1390,17 @@ impl Engine {
         {
             return Ok(UploadPreparation::Skipped);
         }
-        if self.copy_if_declines(&source, existing.as_ref())? {
+        if self.args.expressions.update.is_some()
+            && !self.args.expressions.permits(
+                &source.expression_file()?,
+                source.expression_path(),
+                &existing
+                    .as_ref()
+                    .map(Object::expression_file)
+                    .unwrap_or_default(),
+                self.expression_destination_path(&source.key),
+            )?
+        {
             return Ok(UploadPreparation::Skipped);
         }
 
@@ -1429,7 +1411,16 @@ impl Engine {
             "destination already exists: {} (--if-exists=error)",
             source.key
         );
-        if self.newer_destination(&source, existing.as_ref()) {
+        if self.args.update
+            && source.kind() != ObjectKind::Dir
+            && existing.as_ref().is_some_and(|o| {
+                let time = o
+                    .metadata
+                    .as_ref()
+                    .map_or((o.mtime, 0), |m| (m.mtime, m.nsec));
+                time > (source.meta.mtime, source.meta.mtime_nsec)
+            })
+        {
             return Ok(UploadPreparation::Skipped);
         }
         let size = if source.kind() == ObjectKind::Dir {
@@ -1649,14 +1640,6 @@ impl Engine {
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        // Only a destination listed before the copy spares a key its HEAD, and
-        // another writer may have created the object since. Where the policy
-        // would judge that object, the write must not replace it unseen.
-        let guard_absence = head.is_none()
-            && !must_be_new
-            && self.authorization.is_none()
-            && (self.args.expressions.update.is_some()
-                || (self.args.update && source.kind() != ObjectKind::Dir));
         let multipart = if size > part_size && source.kind() == ObjectKind::File {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
@@ -1674,64 +1657,10 @@ impl Engine {
             payload,
             metadata,
             must_be_new,
-            guard_absence,
             multipart,
             metadata_update: None,
         };
         Ok(UploadPreparation::Ready(Box::new(prepared)))
-    }
-
-    /// Whether `--copy-if` declines to copy `source` over `existing`.
-    fn copy_if_declines(&self, source: &Source, existing: Option<&Object>) -> Result<bool> {
-        Ok(self.args.expressions.update.is_some()
-            && !self.args.expressions.permits(
-                &source.expression_file()?,
-                source.expression_path(),
-                &existing.map(Object::expression_file).unwrap_or_default(),
-                self.expression_destination_path(&source.key),
-            )?)
-    }
-
-    /// Whether `--if-exists=update-if-older` keeps `existing` as newer than
-    /// `source`.
-    fn newer_destination(&self, source: &Source, existing: Option<&Object>) -> bool {
-        self.args.update
-            && source.kind() != ObjectKind::Dir
-            && existing.is_some_and(|o| {
-                let time = o
-                    .metadata
-                    .as_ref()
-                    .map_or((o.mtime, 0), |m| (m.mtime, m.nsec));
-                time > (source.meta.mtime, source.meta.mtime_nsec)
-            })
-    }
-
-    /// A create-only write of `source` was refused (`guard_absence`): judge
-    /// the object now there as a HEAD before the copy would have, after
-    /// `attempt` refusals. An object that keeps reappearing fails the copy
-    /// rather than have it write again without end.
-    async fn judge_concurrent(&self, source: &Source, attempt: u32) -> Result<Concurrent> {
-        let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
-            .await?
-            .map(|head| client::from_head(&source.key, &head))
-            .transpose()?;
-        let Some(existing) = head else {
-            anyhow::ensure!(
-                attempt < CONCURRENT_ATTEMPTS,
-                "destination keeps being created and removed during the copy: {}",
-                source.key
-            );
-            return Ok(Concurrent::Absent);
-        };
-        Ok(
-            if self.copy_if_declines(source, Some(&existing))?
-                || self.newer_destination(source, Some(&existing))
-            {
-                Concurrent::Kept
-            } else {
-                Concurrent::Replaced
-            },
-        )
     }
 
     async fn upload(self: &Arc<Self>, source: Source, listed: Listed) -> Result<Option<u64>> {
@@ -1774,7 +1703,6 @@ impl Engine {
             payload,
             metadata,
             must_be_new,
-            guard_absence,
             multipart,
             metadata_update: _,
         } = prepared;
@@ -1782,64 +1710,43 @@ impl Engine {
         if size <= part_size || source.kind() != ObjectKind::File {
             let checksum = checksums.first().map(String::as_str);
             let mut slot = self.tuning.requests.acquire().await;
-            let mut guard = guard_absence;
-            let mut attempt = 0;
-            loop {
-                let create_only = must_be_new || guard;
-                let sent = self
-                    .upload_request(&source.key, None, algorithm, checksum)
-                    .send(
-                        async {
-                            let body = request_payload(payload.as_ref(), &source).await?;
-                            content_md5(&body, 0, size).await
-                        },
-                        |content_md5| {
-                            let (source, payload, metadata) = (&source, &payload, &metadata);
-                            async move {
-                                self.check_cancelled()?;
-                                // A streamed PUT must still name the selected file on every attempt.
-                                let payload = request_payload(payload.as_ref(), source).await?;
-                                let body = upload_body(&payload, 0, size);
-                                self.pace(size).await?;
-                                let result = self
-                                    .client
-                                    .put_object()
-                                    .bucket(&self.options.bucket)
-                                    .key(&source.key)
-                                    .body(body)
-                                    .content_length(size as i64)
-                                    .set_checksum_sha256(
-                                        algorithm.header(Algorithm::Sha256, checksum),
-                                    )
-                                    .set_content_md5(content_md5)
-                                    .set_metadata(Some(metadata.encode()))
-                                    .set_if_none_match(create_only.then(|| "*".into()))
-                                    .customize()
-                                    .config_override(super::client::without_sdk_retries())
-                                    .disable_payload_signing()
-                                    .send()
-                                    .await;
-                                Ok(result)
-                            }
-                        },
-                    )
-                    .await?;
-                match sent {
-                    Err(error) if guard && client::precondition_failed(&error) => {
-                        attempt += 1;
-                        match self.judge_concurrent(&source, attempt).await? {
-                            Concurrent::Kept => return Ok(None),
-                            Concurrent::Replaced => guard = false,
-                            Concurrent::Absent => {}
+            self.upload_request(&source.key, None, algorithm, checksum)
+                .send(
+                    async {
+                        let body = request_payload(payload.as_ref(), &source).await?;
+                        content_md5(&body, 0, size).await
+                    },
+                    |content_md5| {
+                        let (source, payload, metadata) = (&source, &payload, &metadata);
+                        async move {
+                            self.check_cancelled()?;
+                            // A streamed PUT must still name the selected file on every attempt.
+                            let payload = request_payload(payload.as_ref(), source).await?;
+                            let body = upload_body(&payload, 0, size);
+                            self.pace(size).await?;
+                            let result = self
+                                .client
+                                .put_object()
+                                .bucket(&self.options.bucket)
+                                .key(&source.key)
+                                .body(body)
+                                .content_length(size as i64)
+                                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
+                                .set_content_md5(content_md5)
+                                .set_metadata(Some(metadata.encode()))
+                                .set_if_none_match(must_be_new.then(|| "*".into()))
+                                .customize()
+                                .config_override(super::client::without_sdk_retries())
+                                .disable_payload_signing()
+                                .send()
+                                .await;
+                            Ok(result)
                         }
-                    }
-                    sent => {
-                        sent.map_err(|e| e.into_service_error())
-                            .context("S3 PUT failed")?;
-                        break;
-                    }
-                }
-            }
+                    },
+                )
+                .await?
+                .map_err(|e| e.into_service_error())
+                .context("S3 PUT failed")?;
             slot.completed(size);
             self.progress.add_bytes(size);
         } else {
@@ -1864,9 +1771,7 @@ impl Engine {
                 // Its in-memory ID suffices; no process can resume it from disk.
                 State::without_cache()
             };
-            // Whether the upload was published, or left an object another
-            // writer created in its place.
-            let result: Result<bool> = async {
+            let result: Result<()> = async {
                 // Storage-authorized files reopen after preparation. A reopen failure
                 // here must abort the upload when no recovery record can keep it.
                 let payload = if self.authorization.is_some() {
@@ -2018,55 +1923,29 @@ impl Engine {
                 source.open()?;
                 let mut completed = completed;
                 completed.sort_by_key(|p| p.part_number());
-                let completed = CompletedMultipartUpload::builder()
-                    .set_parts(Some(completed))
-                    .build();
-                // A refused create-only completion leaves the upload and its
-                // parts in place, to complete again or abort.
-                let mut guard = guard_absence;
-                let mut attempt = 0;
-                loop {
-                    let sent = self
-                        .client
-                        .complete_multipart_upload()
-                        .bucket(&self.options.bucket)
-                        .key(&source.key)
-                        .upload_id(&upload.upload_id)
-                        .multipart_upload(completed.clone())
-                        .set_if_none_match((must_be_new || guard).then(|| "*".into()))
-                        .send()
-                        .await;
-                    match sent {
-                        Err(error) if guard && client::precondition_failed(&error) => {
-                            attempt += 1;
-                            let _slot = self.tuning.requests.acquire().await;
-                            match self.judge_concurrent(&source, attempt).await? {
-                                Concurrent::Kept => return Ok(false),
-                                Concurrent::Replaced => guard = false,
-                                Concurrent::Absent => {}
-                            }
-                        }
-                        sent => {
-                            sent.map_err(|e| e.into_service_error()).context(
-                                "complete multipart upload; rerun the command to recover",
-                            )?;
-                            return Ok(true);
-                        }
-                    }
-                }
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.options.bucket)
+                    .key(&source.key)
+                    .upload_id(&upload.upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(completed))
+                            .build(),
+                    )
+                    .set_if_none_match(must_be_new.then(|| "*".into()))
+                    .send()
+                    .await
+                    .map_err(|e| e.into_service_error())
+                    .context("complete multipart upload; rerun the command to recover")?;
+                Ok(())
             }
             .await;
             if result.is_err() && !state.has_record() {
                 self.abort_unrecorded_upload(&source.key, &upload.upload_id)
                     .await;
             }
-            if !result? {
-                // Its parts would only ever replace the object kept.
-                self.abort_unrecorded_upload(&source.key, &upload.upload_id)
-                    .await;
-                state.clear()?;
-                return Ok(None);
-            }
+            result?;
             state.clear()?;
         }
         if source.kind() == ObjectKind::File {

@@ -1553,10 +1553,6 @@ fn serve(
         serve_copy_empty(&mut socket, first, &probes, &gate);
         return;
     }
-    if fault.starts_with("empty-race") {
-        serve_empty_race(&mut socket, first, &headers, fault, &probes, &gate);
-        return;
-    }
     if fault.starts_with("empty-destination") {
         // A destination prefix that holds nothing, or under `-one` only an
         // object no planned key names. Listings ignore where they are asked
@@ -5784,13 +5780,15 @@ fn serve_copy_empty(
 fn s3_bucket_copy_into_an_empty_prefix_checks_keys_it_must_not_replace() {
     // A store need not enforce If-None-Match on CopyObject, so a copy that
     // protects existing objects asks about each key, however empty the
-    // destination looked; one that writes only over existing keys does not.
+    // destination looked; one that writes nothing over a key it finds absent
+    // does not.
     for (flags, heads, lists) in [
         (&["--if-exists=keep"][..], 64, false),
         (&["--if-exists=update-if-older"], 64, true),
         (&["--copy-if", "not dst.exists"], 64, true),
         (&["--if-exists=error-if-different"], 64, true),
         (&["--only-existing"], 0, true),
+        (&["--if-exists=error", "--dry-run"], 0, true),
     ] {
         let server = Server::start("copy-empty");
         let temp = test_support::tempdir().unwrap();
@@ -5815,236 +5813,6 @@ fn s3_bucket_copy_into_an_empty_prefix_checks_keys_it_must_not_replace() {
         // Under --if-exists=keep no listing is sent at all.
         assert_eq!(server.gate.0.load(Ordering::Relaxed), lists, "{flags:?}");
     }
-}
-
-/// An upload to `data/` in a bucket that held nothing when the copy listed
-/// it. Another writer then creates `data/f000`: a create-only write of it is
-/// refused, and a HEAD finds an object older or newer than any file the test
-/// writes (`-older`, `-newer`). Under `-gone`, the first HEAD finds it removed
-/// again; under `-vanishing`, every write is refused and every HEAD finds
-/// nothing. Under `-multipart`, `data/f000` takes two parts and its
-/// completion is refused instead. `probes` counts HEADs, `gate.0` records a
-/// write of `data/f000` without the condition, and `gate.1` a HEAD of it.
-fn serve_empty_race(
-    socket: &mut TcpStream,
-    first: &str,
-    headers: &std::collections::HashMap<String, String>,
-    fault: &str,
-    probes: &AtomicUsize,
-    gate: &(AtomicBool, AtomicBool),
-) {
-    let method = first.split_whitespace().next().unwrap();
-    let target = first.split_whitespace().nth(1).unwrap();
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    // The SDK names its operation in the query.
-    let query = query
-        .split('&')
-        .filter(|pair| !pair.is_empty() && !pair.starts_with("x-id="))
-        .collect::<Vec<_>>()
-        .join("&");
-    let query = query.as_str();
-    let body = |socket: &mut TcpStream| {
-        let length: usize = headers
-            .get("content-length")
-            .map_or(0, |length| length.parse().unwrap());
-        let mut body = vec![0; length];
-        socket.read_exact(&mut body).unwrap();
-        body
-    };
-    let create_only = headers.get("if-none-match").map(String::as_str) == Some("*");
-    let refused = b"<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>";
-    if method == "GET" && query.contains("list-type=2") {
-        assert!(query.contains("prefix=data%2F"), "{first}");
-        reply(
-            socket,
-            200,
-            &[],
-            b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
-            false,
-        );
-        return;
-    }
-    if path != "/bucket/data/f000" {
-        // Other keys see no other writer.
-        assert_eq!(
-            (method, path, query),
-            ("PUT", "/bucket/data/f001", ""),
-            "{first}"
-        );
-        assert!(create_only, "{first}");
-        assert_eq!(body(socket), b"x");
-        reply(
-            socket,
-            200,
-            &[("ETag".into(), "\"written\"".into())],
-            b"",
-            false,
-        );
-        return;
-    }
-    match method {
-        "HEAD" => {
-            probes.fetch_add(1, Ordering::Relaxed);
-            let seen = gate.1.swap(true, Ordering::Relaxed);
-            let modified = match fault.trim_end_matches("-multipart") {
-                "empty-race-older" => "Sat, 01 Jan 2000 00:00:00 GMT",
-                "empty-race-newer" => "Fri, 01 Jan 2100 00:00:00 GMT",
-                "empty-race-gone" if seen => panic!("second HEAD: {first}"),
-                _ => return reply(socket, 404, &[], b"", true),
-            };
-            reply(
-                socket,
-                200,
-                &[
-                    ("Content-Length".into(), "1".into()),
-                    ("ETag".into(), "\"other\"".into()),
-                    ("Last-Modified".into(), modified.into()),
-                ],
-                b"",
-                true,
-            );
-        }
-        "POST" if query == "uploads" => {
-            assert!(fault.ends_with("-multipart"), "{first}");
-            reply(
-                socket,
-                200,
-                &[],
-                b"<InitiateMultipartUploadResult><UploadId>race</UploadId></InitiateMultipartUploadResult>",
-                false,
-            );
-        }
-        "PUT" if query.contains("partNumber=") => {
-            assert!(query.contains("uploadId=race"), "{first}");
-            body(socket);
-            reply(
-                socket,
-                200,
-                &[("ETag".into(), "\"part\"".into())],
-                b"",
-                false,
-            );
-        }
-        "PUT" | "POST" => {
-            assert_eq!(method == "POST", fault.ends_with("-multipart"), "{first}");
-            body(socket);
-            let gone = fault == "empty-race-gone" && gate.1.load(Ordering::Relaxed);
-            if create_only && !gone {
-                reply(socket, 412, &[], refused, false);
-                return;
-            }
-            // Only a policy that replaces the object writes without the
-            // condition, and only after looking at it.
-            assert!(gate.1.load(Ordering::Relaxed), "{first}");
-            if !create_only {
-                assert!(fault.starts_with("empty-race-older"), "{first}");
-                gate.0.store(true, Ordering::Relaxed);
-            }
-            if method == "POST" {
-                reply(
-                    socket,
-                    200,
-                    &[],
-                    b"<CompleteMultipartUploadResult><ETag>&quot;complete&quot;</ETag></CompleteMultipartUploadResult>",
-                    false,
-                );
-            } else {
-                reply(
-                    socket,
-                    200,
-                    &[("ETag".into(), "\"written\"".into())],
-                    b"",
-                    false,
-                );
-            }
-        }
-        "DELETE" => {
-            // The upload's parts are discarded when the object is kept.
-            assert_eq!(fault, "empty-race-newer-multipart", "{first}");
-            assert!(query.contains("uploadId=race"), "{first}");
-            reply(socket, 204, &[], b"", false);
-        }
-        _ => panic!("unexpected empty-race request: {first}"),
-    }
-}
-
-/// Upload `data/f000` and `data/f001` to the `empty-race` fixture `fault`
-/// with `flags`: one byte each, or under `-multipart` `data/f000` in two
-/// parts. Return the output, every request, the HEADs, and whether
-/// `data/f000` was written without the condition.
-fn upload_racing_another_writer(
-    fault: &'static str,
-    flags: &[&str],
-) -> (Output, usize, usize, bool) {
-    let server = Server::start(fault);
-    let temp = test_support::tempdir().unwrap();
-    let data = temp.path().join("data");
-    std::fs::create_dir(&data).unwrap();
-    let size = if fault.ends_with("-multipart") {
-        SIZE
-    } else {
-        1
-    };
-    std::fs::write(data.join("f000"), vec![b'x'; size]).unwrap();
-    std::fs::write(data.join("f001"), b"x").unwrap();
-    let output = server
-        .command(temp.path())
-        .args(["--s3-endpoint", &server.address])
-        .args(["--srcs-in", "data", "--to", "s3://bucket", "--into", "data"])
-        .args(flags)
-        .capture_output()
-        .unwrap();
-    let requests = server.requests.load(Ordering::Relaxed);
-    let heads = server.probes.load(Ordering::Relaxed);
-    let replaced = server.gate.0.load(Ordering::Relaxed);
-    drop(server);
-    (output, requests, heads, replaced)
-}
-
-#[test]
-fn s3_upload_judges_an_object_created_after_the_destination_looked_empty() {
-    let update = &["--if-exists=update-if-older"][..];
-    let absent = &["--copy-if", "not dst.exists"][..];
-    // The listing, f001's write, f000's refused write and its HEAD: a newer
-    // object is kept, an older one replaced, and one --copy-if declines
-    // kept.
-    for (fault, flags, requests, replaced) in [
-        ("empty-race-newer", update, 4, false),
-        ("empty-race-older", update, 5, true),
-        ("empty-race-older", absent, 4, false),
-        // Removed again before the HEAD: written create-only again.
-        ("empty-race-gone", update, 5, false),
-        // The listing, the initiation, two parts, the refused completion,
-        // the HEAD, and then the abort or the completion again.
-        ("empty-race-newer-multipart", update, 8, false),
-        ("empty-race-older-multipart", update, 8, true),
-    ] {
-        let (output, sent, heads, written) = upload_racing_another_writer(fault, flags);
-        assert!(
-            output.status.success(),
-            "{fault} {flags:?}: {}",
-            output_text(&output)
-        );
-        assert_eq!(
-            (sent, heads, written),
-            (requests, 1, replaced),
-            "{fault} {flags:?}"
-        );
-    }
-}
-
-#[test]
-fn s3_upload_gives_up_on_an_object_that_keeps_appearing_and_disappearing() {
-    let (output, sent, heads, written) =
-        upload_racing_another_writer("empty-race-vanishing", &["--if-exists=update-if-older"]);
-    assert!(!output.status.success(), "{}", output_text(&output));
-    assert!(
-        output_text(&output).contains("keeps being created and removed"),
-        "{}",
-        output_text(&output)
-    );
-    // The listing, f001's write, and three refused writes and HEADs of f000.
-    assert_eq!((sent, heads, written), (8, 3, false));
 }
 
 #[cfg(debug_assertions)]
@@ -6224,19 +5992,12 @@ fn upload_to_empty_destination(
 }
 
 #[test]
-fn s3_upload_into_an_empty_prefix_needs_no_heads_under_any_overwrite_policy() {
+fn s3_upload_into_an_empty_prefix_needs_no_heads_where_no_object_could_be_replaced_unseen() {
     for bucket in ["bucket", "bucket--use1-az1--x-s3"] {
         for (fault, flags, lists) in [
             // A request beside the listing that follows the plan.
             ("empty-destination-new", &["--if-exists=keep"][..], 2),
             ("empty-destination", &["--only-existing"], 1),
-            // These write create-only and judge an object refusing it.
-            ("empty-destination-new", &["--if-exists=update-if-older"], 1),
-            (
-                "empty-destination-new",
-                &["--copy-if", "not dst.exists or src.size != dst.size"],
-                1,
-            ),
             (
                 "empty-destination-new",
                 &["--if-exists=error-if-different"],
@@ -6252,6 +6013,25 @@ fn s3_upload_into_an_empty_prefix_needs_no_heads_under_any_overwrite_policy() {
                 "{bucket} {flags:?}"
             );
         }
+    }
+}
+
+#[test]
+fn s3_upload_into_an_empty_prefix_checks_each_key_it_would_judge() {
+    // An object another writer creates after the request that showed the
+    // prefix empty would be replaced without being judged, so each key still
+    // gets its HEAD, and the writes stay unconditional. (A directory bucket's
+    // complete listing, which this request already is there, decides keys
+    // for these policies as it did before.)
+    for flags in [
+        &["--if-exists=update-if-older"][..],
+        &["--copy-if", "not dst.exists or src.size != dst.size"],
+    ] {
+        assert_eq!(
+            upload_to_empty_destination("empty-destination", "bucket", 64, flags),
+            (1, 64),
+            "{flags:?}"
+        );
     }
 }
 
@@ -6296,9 +6076,19 @@ fn s3_upload_of_a_small_plan_lists_an_empty_prefix_only_when_it_lists_anyway() {
             "empty-destination-new",
             "bucket",
             20,
-            &["--if-exists=update-if-older"]
+            &["--if-exists=error-if-different"]
         ),
         (1, 0)
+    );
+    // Under update-if-older it still does, but each key keeps its HEAD.
+    assert_eq!(
+        upload_to_empty_destination(
+            "empty-destination",
+            "bucket",
+            20,
+            &["--if-exists=update-if-older"]
+        ),
+        (1, 20)
     );
 }
 
