@@ -109,7 +109,10 @@ pub(super) struct Engine {
     /// The destination keys under each listed prefix, when pruning listed
     /// them before the copy.
     upload_keys: OnceLock<DestinationListing>,
-    /// Otherwise, the planned keys the destination listing has reached.
+    /// Otherwise, a destination prefix that held nothing when the copy
+    /// started: every planned key beneath it is absent.
+    empty_destination: OnceLock<String>,
+    /// And the planned keys the destination listing has reached.
     discovery: OnceLock<Discovery>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
@@ -349,6 +352,7 @@ impl Engine {
             discovered_region,
             progress,
             upload_keys: OnceLock::new(),
+            empty_destination: OnceLock::new(),
             discovery: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
             content_md5: content_md5.into(),
@@ -969,32 +973,48 @@ impl Engine {
             return Ok(());
         }
         if self.args.existing || self.args.ignore_existing {
-            // These upload policies work with object-only permissions. Use
-            // listing as an optional shortcut for a large plan.
-            if self.options.route == Route::Upload
-                && self.authorization.is_none()
-                && !self.args.delete
-                && super::listing::lists_in_key_order(&self.options.bucket)
-                && plan.len() >= discovery::KEYS_PER_PAGE
-            {
+            // These policies work with object-only permissions. Use listing
+            // as an optional shortcut for a large plan.
+            if self.authorization.is_none() && !self.args.delete {
                 let prefixes = self.destination_prefixes()?;
-                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-                let keys = discovery::Keys::new(plan.iter().map(&key));
-                let whole = discovery::Segment::whole(prefixes[0].clone(), &keys);
-                self.start_discovery(vec![whole], keys)
-                    .await
-                    .or_else(|error| {
-                        // Wrong-region errors still get the normal diagnostic.
-                        if self.cancelled.load(Relaxed)
-                            || error
-                                .downcast_ref::<client::RequestFailure>()
-                                .is_some_and(client::RequestFailure::region_mismatch)
-                        {
-                            Err(error)
-                        } else {
-                            Ok(())
+                let prefix = prefixes[0].as_str();
+                let walks = self.options.route == Route::Upload
+                    && super::listing::lists_in_key_order(&self.options.bucket)
+                    && plan.len() >= discovery::KEYS_PER_PAGE;
+                // The listing that follows the plan already shows keys absent
+                // to --only-existing, which skips them, but a key it shows
+                // absent still gets a HEAD under --if-exists=keep.
+                let probes = (self.args.ignore_existing || !walks)
+                    && self.trusts_empty()
+                    && plan
+                        .iter()
+                        .filter(|planned| key(planned).starts_with(prefix))
+                        .count()
+                        >= discovery::EMPTY_PROBE_KEYS;
+                let walk = if walks {
+                    plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                    let keys = discovery::Keys::new(plan.iter().map(&key));
+                    let whole = discovery::Segment::whole(prefix.to_owned(), &keys);
+                    Some((vec![whole], keys))
+                } else {
+                    None
+                };
+                let (probed, walked) = tokio::join!(
+                    async {
+                        match probes {
+                            true => self.probe_destination(prefix).await,
+                            false => Ok(()),
                         }
-                    })?;
+                    },
+                    async {
+                        match walk {
+                            Some((segments, keys)) => self.start_discovery(segments, keys).await,
+                            None => Ok(()),
+                        }
+                    },
+                );
+                self.optional_listing(probed)?;
+                self.optional_listing(walked)?;
             }
             return Ok(());
         }
@@ -1003,13 +1023,13 @@ impl Engine {
             let lists = discovery::lists_destination(&self.args, &self.options.bucket);
             if self.authorization.is_none() {
                 if !lists {
-                    // Every key gets its HEAD, so a listing would save
-                    // nothing. One request still goes first: the copy sizes
-                    // its concurrency from a response seen before it starts,
-                    // and a destination that cannot be listed fails here, as
-                    // it does for the copies that list.
-                    client::list_one(&self.client, &self.options.bucket, &prefixes[0]).await?;
-                    return Ok(());
+                    // A listing that follows the plan would save no HEAD. One
+                    // request still goes first: the copy sizes its
+                    // concurrency from a response seen before it starts, a
+                    // destination that cannot be listed fails here, as it
+                    // does for the copies that list, and an empty prefix
+                    // needs no HEAD at all.
+                    return self.probe_destination(&prefixes[0]).await;
                 }
                 plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
                 let keys = discovery::Keys::new(plan.iter().map(&key));
@@ -1038,7 +1058,8 @@ impl Engine {
             }
             // Nothing to list: still send the request the copy sizes its
             // concurrency from, under a signed prefix with planned keys
-            // beneath it if there is one.
+            // beneath it if there is one. If that prefix is empty, its keys
+            // need no HEAD; the other prefixes' keys still get theirs.
             let probe = plan
                 .iter()
                 .find_map(|t| {
@@ -1048,8 +1069,7 @@ impl Engine {
                         .find(|prefix| key.starts_with(prefix.as_str()))
                 })
                 .unwrap_or(&prefixes[0]);
-            client::list_one(&self.client, &self.options.bucket, probe).await?;
-            return Ok(());
+            return self.probe_destination(probe).await;
         }
         // Pruning needs every destination key, including keys absent from
         // the plan. Only this complete cache is reusable by the deletion
@@ -1094,6 +1114,46 @@ impl Engine {
             }
         }
     }
+    /// List `prefix` with one short request. If it shows the prefix holds
+    /// nothing, record that every planned key beneath it is absent, where
+    /// the copy may rely on that ([`Self::trusts_empty`]).
+    async fn probe_destination(&self, prefix: &str) -> Result<()> {
+        let page = client::list_one(&self.client, &self.options.bucket, prefix).await?;
+        if discovery::shows_empty(&page) && self.trusts_empty() {
+            let _ = self.empty_destination.set(prefix.to_owned());
+        }
+        Ok(())
+    }
+    /// Whether a destination prefix shown empty when the copy started may
+    /// spare the keys beneath it their HEADs
+    /// ([`discovery::trusts_empty_prefix`]). A server-side copy's
+    /// `If-None-Match` is not enforced by every store (Cloudflare R2 takes its
+    /// own header for CopyObject), so a server-side copy that writes and
+    /// protects existing objects checks each key.
+    fn trusts_empty(&self) -> bool {
+        let args = &self.args;
+        discovery::trusts_empty_prefix(args)
+            && (!self.options.route.is_server_copy()
+                || args.existing
+                || args.dry_run
+                || !(args.ignore_existing
+                    || args.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
+    }
+    /// The result of a listing the copy can do without: its failure leaves
+    /// each key to its HEAD. A wrong region still gets the normal diagnostic.
+    fn optional_listing(&self, result: Result<()>) -> Result<()> {
+        result.or_else(|error| {
+            if self.cancelled.load(Relaxed)
+                || error
+                    .downcast_ref::<client::RequestFailure>()
+                    .is_some_and(client::RequestFailure::region_mismatch)
+            {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        })
+    }
     async fn start_discovery(
         &self,
         segments: Vec<discovery::Segment>,
@@ -1122,6 +1182,7 @@ impl Engine {
         discovery::listed(
             &self.args,
             self.upload_keys.get(),
+            self.empty_destination.get().map(String::as_str),
             self.discovery.get(),
             position,
             key,
@@ -1133,6 +1194,7 @@ impl Engine {
         discovery::known(
             &self.args,
             self.upload_keys.get(),
+            self.empty_destination.get().map(String::as_str),
             self.discovery.get(),
             position,
             key,
@@ -1309,7 +1371,9 @@ impl Engine {
             return Ok(UploadPreparation::Skipped);
         }
         let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
-        let head = if listed == Listed::Absent && !self.args.ignore_existing {
+        // Under --if-exists=keep, only a complete listing or an empty prefix
+        // reports a key absent (`discovery::listed`).
+        let head = if listed == Listed::Absent {
             None
         } else {
             // A check is a request like any other: the request limit bounds
@@ -4193,6 +4257,7 @@ mod tests {
             progress: Progress::new(false, false, None),
             bandwidth: None,
             upload_keys: OnceLock::new(),
+            empty_destination: OnceLock::new(),
             discovery: OnceLock::new(),
             authorization: None,
             copy_checksum_unsupported: Default::default(),

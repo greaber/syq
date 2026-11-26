@@ -1549,6 +1549,56 @@ fn serve(
         serve_copy_pages(&mut socket, first, &probes);
         return;
     }
+    if fault == "copy-empty" {
+        serve_copy_empty(&mut socket, first, &probes, &gate);
+        return;
+    }
+    if fault.starts_with("empty-destination") {
+        // A destination prefix that holds nothing, or under `-one` only an
+        // object no planned key names. Listings ignore where they are asked
+        // to start, so nothing can rely on the order of their keys.
+        let target = first.split_whitespace().nth(1).unwrap();
+        if method == "GET" && target.contains("list-type=2") {
+            assert!(target.contains("prefix=data%2F"), "{first}");
+            assert!(!target.contains("continuation-token"), "{first}");
+            probes.fetch_add(1, Ordering::Relaxed);
+            let contents = if fault.ends_with("-one") {
+                "<Contents><Key>data/unrelated</Key><Size>1</Size></Contents>"
+            } else {
+                ""
+            };
+            let listing = format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+            );
+            reply(&mut socket, 200, &[], listing.as_bytes(), false);
+            return;
+        }
+        let key = target.split('?').next().unwrap();
+        assert!(key.contains("/data/f"), "{first}");
+        if method == "HEAD" {
+            reply(&mut socket, 404, &[], b"", true);
+            return;
+        }
+        assert_eq!(method, "PUT", "{first}");
+        // Policies that must not replace an object still write conditionally.
+        assert_eq!(
+            headers.get("if-none-match").map(String::as_str),
+            fault.ends_with("-new").then_some("*"),
+            "{first}"
+        );
+        let mut bytes = [0];
+        socket.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [b'x']);
+        gate.0.store(true, Ordering::Relaxed);
+        reply(
+            &mut socket,
+            200,
+            &[("ETag".into(), r#""written""#.into())],
+            b"",
+            false,
+        );
+        return;
+    }
     if fault.starts_with("upload-selection") {
         let target = first.split_whitespace().nth(1).unwrap();
         if method == "GET" && target.contains("list-type=2") {
@@ -5667,6 +5717,104 @@ fn serve_copy_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
     }
 }
 
+/// Bucket to bucket into `out/`, which holds nothing, from `data/k00` to
+/// `data/k63`. `probes` counts the destination's HEADs and `gate.0` records
+/// its listing.
+fn serve_copy_empty(
+    socket: &mut TcpStream,
+    first: &str,
+    probes: &AtomicUsize,
+    gate: &(AtomicBool, AtomicBool),
+) {
+    let method = first.split_whitespace().next().unwrap();
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let page = |objects: String| {
+        format!("<ListBucketResult><IsTruncated>false</IsTruncated>{objects}</ListBucketResult>")
+    };
+    match (method, url.path()) {
+        ("GET", "/source/") => {
+            assert_eq!(query["prefix"], "data/");
+            let objects: String = (0..64)
+                .map(|n| format!("<Contents><Key>data/k{n:02}</Key><Size>4</Size></Contents>"))
+                .collect();
+            reply(socket, 200, &[], page(objects).as_bytes(), false);
+        }
+        ("GET", "/destination/") => {
+            assert_eq!(query["prefix"], "out/");
+            gate.0.store(true, Ordering::Relaxed);
+            reply(socket, 200, &[], page(String::new()).as_bytes(), false);
+        }
+        ("HEAD", "/source/data") => reply(socket, 404, &[], b"", true),
+        ("HEAD", path) if path.starts_with("/source/data/k") => reply(
+            socket,
+            200,
+            &[
+                ("Content-Length".into(), "4".into()),
+                ("ETag".into(), "\"source\"".into()),
+                (
+                    "Last-Modified".into(),
+                    "Wed, 01 Jan 2020 00:00:00 GMT".into(),
+                ),
+            ],
+            b"",
+            true,
+        ),
+        ("HEAD", path) if path.starts_with("/destination/out/k") => {
+            probes.fetch_add(1, Ordering::Relaxed);
+            reply(socket, 404, &[], b"", true);
+        }
+        ("PUT", path) if path.starts_with("/destination/out/k") => reply(
+            socket,
+            200,
+            &[],
+            b"<CopyObjectResult><ETag>&quot;source&quot;</ETag></CopyObjectResult>",
+            false,
+        ),
+        _ => panic!("unexpected copy-empty request: {first}"),
+    }
+}
+
+#[test]
+fn s3_bucket_copy_into_an_empty_prefix_checks_keys_it_must_not_replace() {
+    // A store need not enforce If-None-Match on CopyObject, so a copy that
+    // protects existing objects asks about each key, however empty the
+    // destination looked; one that writes nothing over a key it finds absent
+    // does not.
+    for (flags, heads, lists) in [
+        (&["--if-exists=keep"][..], 64, false),
+        (&["--if-exists=update-if-older"], 64, true),
+        (&["--copy-if", "not dst.exists"], 64, true),
+        (&["--if-exists=error-if-different"], 64, true),
+        (&["--only-existing"], 0, true),
+        (&["--if-exists=error", "--dry-run"], 0, true),
+    ] {
+        let server = Server::start("copy-empty");
+        let temp = test_support::tempdir().unwrap();
+        let mut args = vec![
+            "--from",
+            "s3://source",
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://destination",
+            "--into",
+            "out",
+        ];
+        args.extend(flags);
+        let output = server.cp(temp.path(), &args);
+        assert!(
+            output.status.success(),
+            "{flags:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.probes.load(Ordering::Relaxed), heads, "{flags:?}");
+        // Under --if-exists=keep no listing is sent at all.
+        assert_eq!(server.gate.0.load(Ordering::Relaxed), lists, "{flags:?}");
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
@@ -5726,10 +5874,10 @@ fn s3_upload_pages_through_a_large_destination_while_copying() {
 #[cfg(debug_assertions)]
 #[test]
 fn s3_upload_existence_policies_skip_heads_for_keys_the_listing_rules_out() {
-    for (fault, flag, heads) in [
-        ("upload-selection-ignore", "--if-exists=keep", 64),
-        ("upload-selection-only", "--only-existing", 64),
-        ("upload-selection-denied", "--if-exists=keep", 128),
+    for (fault, flag, heads, lists) in [
+        ("upload-selection-ignore", "--if-exists=keep", 64, 2),
+        ("upload-selection-only", "--only-existing", 64, 1),
+        ("upload-selection-denied", "--if-exists=keep", 128, 2),
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
@@ -5751,10 +5899,13 @@ fn s3_upload_existence_policies_skip_heads_for_keys_the_listing_rules_out() {
             ],
         );
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
-        assert_eq!(server.probes.load(Ordering::Relaxed), 1, "{fault}");
+        // Under --if-exists=keep, a request beside the listing asks whether
+        // the prefix is empty; a key the listing shows absent still gets its
+        // HEAD.
+        assert_eq!(server.probes.load(Ordering::Relaxed), lists, "{fault}");
         assert_eq!(
             server.requests.load(Ordering::Relaxed),
-            1 + heads + 64,
+            lists + heads + 64,
             "{fault}"
         );
     }
@@ -5790,9 +5941,155 @@ fn s3_upload_existence_policies_do_not_page_through_sparse_directory_buckets() {
             .capture_output()
             .unwrap();
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
-        assert_eq!(server.probes.load(Ordering::Relaxed), 0, "{fault}");
-        assert_eq!(server.requests.load(Ordering::Relaxed), 64, "{fault}");
+        // One request asks whether the prefix is empty. It is not, and the
+        // listing goes no further.
+        assert_eq!(server.probes.load(Ordering::Relaxed), 1, "{fault}");
+        assert_eq!(server.requests.load(Ordering::Relaxed), 1 + 64, "{fault}");
     }
+}
+
+/// Upload `files` one-byte files to `bucket`'s prefix `data/` from fixture
+/// `fault`, with `flags`, and return the server's LIST and HEAD counts.
+fn upload_to_empty_destination(
+    fault: &'static str,
+    bucket: &str,
+    files: usize,
+    flags: &[&str],
+) -> (usize, usize) {
+    let server = Server::start(fault);
+    let temp = test_support::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    for n in 0..files {
+        std::fs::write(data.join(format!("f{n:03}")), b"x").unwrap();
+    }
+    let destination = format!("s3://{bucket}");
+    let output = server
+        .command(temp.path())
+        .env("AWS_S3_DISABLE_EXPRESS_SESSION_AUTH", "true")
+        .args(["--s3-endpoint", &server.address])
+        .args(["--srcs-in", "data", "--to", &destination, "--into", "data"])
+        .args(flags)
+        .capture_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{fault} {bucket} {flags:?}: {}",
+        output_text(&output)
+    );
+    let writes = flags
+        .iter()
+        .all(|flag| !["--dry-run", "--only-existing"].contains(flag));
+    assert_eq!(
+        server.gate.0.load(Ordering::Relaxed),
+        writes && files > 0,
+        "{fault} {bucket} {flags:?}"
+    );
+    let lists = server.probes.load(Ordering::Relaxed);
+    let puts = if writes { files } else { 0 };
+    let heads = server.requests.load(Ordering::Relaxed) - lists - puts;
+    (lists, heads)
+}
+
+#[test]
+fn s3_upload_into_an_empty_prefix_needs_no_heads_where_no_object_could_be_replaced_unseen() {
+    for bucket in ["bucket", "bucket--use1-az1--x-s3"] {
+        for (fault, flags, lists) in [
+            // A request beside the listing that follows the plan.
+            ("empty-destination-new", &["--if-exists=keep"][..], 2),
+            ("empty-destination", &["--only-existing"], 1),
+            (
+                "empty-destination-new",
+                &["--if-exists=error-if-different"],
+                1,
+            ),
+            ("empty-destination", &["--if-exists=error", "--dry-run"], 1),
+        ] {
+            // A directory bucket's listing does not follow the plan.
+            let lists = if bucket == "bucket" { lists } else { 1 };
+            assert_eq!(
+                upload_to_empty_destination(fault, bucket, 64, flags),
+                (lists, 0),
+                "{bucket} {flags:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn s3_upload_into_an_empty_prefix_checks_each_key_it_would_judge() {
+    // An object another writer creates after the request that showed the
+    // prefix empty would be replaced without being judged, so each key still
+    // gets its HEAD, and the writes stay unconditional. (A directory bucket's
+    // complete listing, which this request already is there, decides keys
+    // for these policies as it did before.)
+    for flags in [
+        &["--if-exists=update-if-older"][..],
+        &["--copy-if", "not dst.exists or src.size != dst.size"],
+    ] {
+        assert_eq!(
+            upload_to_empty_destination("empty-destination", "bucket", 64, flags),
+            (1, 64),
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_into_a_prefix_with_any_object_checks_each_key() {
+    // One object no planned key names: the request that shows it ends the
+    // listing, and each planned key gets its HEAD.
+    for (flags, lists) in [
+        (&["--if-exists=keep"][..], 2),
+        (&["--if-exists=update-if-older"], 1),
+        (&["--copy-if", "not dst.exists or src.size != dst.size"], 1),
+        (&["--if-exists=error-if-different"], 1),
+        (&["--if-exists=error"], 1),
+    ] {
+        let mut flags = flags.to_vec();
+        flags.push("--dry-run");
+        assert_eq!(
+            upload_to_empty_destination("empty-destination-one", "bucket", 64, &flags),
+            (lists, 64),
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_of_a_small_plan_lists_an_empty_prefix_only_when_it_lists_anyway() {
+    // Existence-only policies send no listing for a plan this small.
+    for (fault, flags) in [
+        ("empty-destination-new", &["--if-exists=keep"][..]),
+        ("empty-destination", &["--only-existing"]),
+    ] {
+        assert_eq!(
+            upload_to_empty_destination(fault, "bucket", 20, flags),
+            (0, 20),
+            "{flags:?}"
+        );
+    }
+    // The others send their one request anyway, and it shows the prefix
+    // empty.
+    assert_eq!(
+        upload_to_empty_destination(
+            "empty-destination-new",
+            "bucket",
+            20,
+            &["--if-exists=error-if-different"]
+        ),
+        (1, 0)
+    );
+    // Under update-if-older it still does, but each key keeps its HEAD.
+    assert_eq!(
+        upload_to_empty_destination(
+            "empty-destination",
+            "bucket",
+            20,
+            &["--if-exists=update-if-older"]
+        ),
+        (1, 20)
+    );
 }
 
 #[test]

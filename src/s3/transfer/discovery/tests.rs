@@ -193,14 +193,26 @@ async fn presigned(
     discovery: Option<&Discovery>,
     plan: &[String],
 ) -> Vec<String> {
+    presigned_under(args, complete, None, discovery, plan).await
+}
+
+/// Like `presigned`, where the destination prefix `empty` held nothing when
+/// the copy started.
+async fn presigned_under(
+    args: &Args,
+    complete: Option<&DestinationListing>,
+    empty: Option<&str>,
+    discovery: Option<&Discovery>,
+    plan: &[String],
+) -> Vec<String> {
     for (position, key) in plan.iter().enumerate() {
-        if let Some(known) = known(args, complete, discovery, position, key) {
-            let listed = listed(args, complete, discovery, position, key).await;
+        if let Some(known) = known(args, complete, empty, discovery, position, key) {
+            let listed = listed(args, complete, empty, discovery, position, key).await;
             assert_eq!(known, listed, "{key}");
         }
     }
     super::super::authorization::upload_checks(plan.iter().map(String::as_str), |position, key| {
-        known(args, complete, discovery, position, key)
+        known(args, complete, empty, discovery, position, key)
     })
     .map(|check| {
         assert_eq!(check.method, "HEAD");
@@ -279,7 +291,7 @@ async fn keys_outside_a_complete_listing_keep_their_checks() {
     };
     let args = cp(&["--prune"]);
     assert_eq!(
-        listed(&args, Some(&complete), None, 1, "data/file").await,
+        listed(&args, Some(&complete), None, None, 1, "data/file").await,
         Listed::Unknown
     );
     assert_eq!(
@@ -369,6 +381,185 @@ async fn copies_that_do_not_list_presign_every_check() {
     let args = cp(&["--if-exists=error", "--dry-run"]);
     assert!(!lists_destination(&args, "bucket"));
     assert_eq!(presigned(&args, None, None, &plan).await, plan);
+}
+
+/// The overwrite policies that check each key with HEAD unless the
+/// destination holds nothing.
+const HEAD_PER_KEY: [&[&str]; 4] = [
+    &["--if-exists=keep"],
+    &["--only-existing"],
+    &["--if-exists=error-if-different"],
+    &["--if-exists=error", "--dry-run"],
+];
+
+/// The overwrite policies that check each key with HEAD however empty the
+/// destination looked: they would replace an object created since without
+/// judging it.
+const HEAD_ALWAYS: [&[&str]; 2] = [
+    &["--if-exists=update-if-older"],
+    &["--copy-if", "not dst.exists or src.size != dst.size"],
+];
+
+#[tokio::test]
+async fn an_empty_prefix_spares_policies_their_checks_beneath_it() {
+    // A directory of files, a directory marker, and beside the prefix a
+    // named file the request that showed it empty could not see.
+    let mut plan: Vec<String> = (0..100).map(|f| format!("data/dir/f{f:03}")).collect();
+    plan.push("data/dir/sub/".to_owned());
+    plan.push("data/file".to_owned());
+    plan.sort();
+    for flags in HEAD_PER_KEY {
+        let args = cp(flags);
+        assert!(!trusts_absence(&args), "{flags:?}");
+        assert!(!lists_destination(&args, "bucket"), "{flags:?}");
+        // Without it, every key is checked.
+        assert_eq!(presigned(&args, None, None, &plan).await, plan, "{flags:?}");
+        // An existing directory marker is accepted under the policies that
+        // protect contents, so only a HEAD may say one is absent.
+        let mut checked = vec!["data/file".to_owned()];
+        if args.protects_existing_contents() {
+            checked.insert(0, "data/dir/sub/".to_owned());
+        }
+        assert_eq!(
+            presigned_under(&args, None, Some("data/dir/"), None, &plan).await,
+            checked,
+            "{flags:?}"
+        );
+        assert_eq!(
+            listed(&args, None, Some("data/dir/"), None, 0, "data/dir/f000").await,
+            Listed::Absent,
+            "{flags:?}"
+        );
+        // A prefix is not the key it names.
+        assert_eq!(
+            listed(&args, None, Some("data/file/"), None, 0, "data/file").await,
+            Listed::Unknown,
+            "{flags:?}"
+        );
+    }
+    // The whole bucket, shown empty, decides every key, the named file too.
+    let args = cp(&["--if-exists=keep"]);
+    assert_eq!(
+        presigned_under(&args, None, Some(""), None, &plan).await,
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn policies_that_judge_existing_objects_ignore_an_empty_prefix() {
+    let mut plan: Vec<String> = (0..100).map(|f| format!("data/dir/f{f:03}")).collect();
+    plan.push("data/dir/sub/".to_owned());
+    plan.sort();
+    for flags in HEAD_ALWAYS {
+        let args = cp(flags);
+        assert!(!trusts_empty_prefix(&args), "{flags:?}");
+        for empty in [Some("data/dir/"), Some("")] {
+            assert_eq!(
+                presigned_under(&args, None, empty, None, &plan).await,
+                plan,
+                "{flags:?} {empty:?}"
+            );
+        }
+        assert_eq!(
+            listed(&args, None, Some("data/dir/"), None, 0, "data/dir/f000").await,
+            Listed::Unknown,
+            "{flags:?}"
+        );
+    }
+    for flags in HEAD_PER_KEY {
+        assert!(trusts_empty_prefix(&cp(flags)), "{flags:?}");
+    }
+}
+
+#[tokio::test]
+async fn keep_relies_only_on_absence_no_order_could_hide() {
+    // Ten destination keys, ten new ones: the listing that follows the plan
+    // shows the new ones absent from where they would fall.
+    let existing: Vec<_> = (0..10).map(|f| format!("data/f{f:02}")).collect();
+    let bucket = Bucket::new(existing.iter().cloned());
+    let mut plan = existing.clone();
+    plan.extend((0..10).map(|f| format!("data/g{f:02}")));
+    plan.sort();
+    let discovery = at_copy_start(&bucket, "data/", &plan).await;
+    // That is enough to skip the new keys, but not to write them.
+    assert_eq!(
+        presigned(&cp(&["--only-existing"]), None, Some(&discovery), &plan).await,
+        existing
+    );
+    let keep = cp(&["--if-exists=keep"]);
+    assert_eq!(presigned(&keep, None, Some(&discovery), &plan).await, plan);
+    assert_eq!(
+        listed(&keep, None, None, Some(&discovery), 0, &plan[0]).await,
+        Listed::Present(1)
+    );
+    assert_eq!(
+        listed(&keep, None, None, Some(&discovery), 10, &plan[10]).await,
+        Listed::Unknown
+    );
+    // A complete listing shows them absent whatever the order.
+    let complete = DestinationListing {
+        prefixes: vec!["data/".to_owned()],
+        keys: existing.iter().map(|key| (key.clone(), 1)).collect(),
+    };
+    assert_eq!(
+        presigned(&keep, Some(&complete), Some(&discovery), &plan).await,
+        existing
+    );
+    // If a concurrent listing sees an object that appeared after an empty
+    // probe, Present wins over the earlier empty probe (for both listed and
+    // known).
+    assert_eq!(
+        listed(&keep, None, Some("data/"), Some(&discovery), 0, &plan[0]).await,
+        Listed::Present(1)
+    );
+    assert_eq!(
+        known(&keep, None, Some("data/"), Some(&discovery), 0, &plan[0]),
+        Some(Listed::Present(1))
+    );
+    assert_eq!(
+        listed(&keep, None, Some("data/"), Some(&discovery), 10, &plan[10]).await,
+        Listed::Absent
+    );
+    assert_eq!(
+        known(&keep, None, Some("data/"), Some(&discovery), 10, &plan[10]),
+        Some(Listed::Absent)
+    );
+}
+
+#[test]
+fn only_a_complete_empty_page_shows_a_prefix_empty() {
+    use aws_sdk_s3::{
+        operation::list_objects_v2::ListObjectsV2Output,
+        types::{CommonPrefix, Object},
+    };
+    let empty = ListObjectsV2Output::builder()
+        .is_truncated(false)
+        .key_count(0)
+        .build();
+    assert!(shows_empty(&empty));
+    for page in [
+        // Missing IsTruncated does not confirm completion; fall back to HEAD.
+        ListObjectsV2Output::builder().build(),
+        ListObjectsV2Output::builder()
+            .is_truncated(false)
+            .contents(Object::builder().key("data/unrelated").size(1).build())
+            .build(),
+        // A directory bucket may return an empty page before the rest.
+        ListObjectsV2Output::builder()
+            .is_truncated(true)
+            .next_continuation_token("next")
+            .build(),
+        ListObjectsV2Output::builder().is_truncated(true).build(),
+        ListObjectsV2Output::builder()
+            .next_continuation_token("next")
+            .build(),
+        ListObjectsV2Output::builder()
+            .is_truncated(false)
+            .common_prefixes(CommonPrefix::builder().prefix("data/dir/").build())
+            .build(),
+    ] {
+        assert!(!shows_empty(&page), "{page:?}");
+    }
 }
 
 /// Every decision must be what a HEAD would have found.
