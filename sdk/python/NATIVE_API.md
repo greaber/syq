@@ -295,12 +295,12 @@ link_target: str | None = None
 
 By default, `include` is `None`: filesystem listings populate `kind`, `size`
 (omitted for directories), and `mtime`, and S3 listings populate `kind`, `size`,
-`s3_last_modified`, and `etag`. On S3, listings alone supply those fields
-without per-object `HEAD` requests unless `where` inspects fields other than
-`path`, `name`, `extension`, `size`, and `s3_last_modified`. Pass `include` with
+`s3_last_modified`, and `etag` from the listing alone. Pass `include` with
 field names (such as `["kind", "mode", "link_target"]`) to select specific
-fields after `path`; asking for S3 `kind`, `mtime`, `mode`, `uid`, or `gid` via
-`include` also sends a `HEAD` request per object.
+fields after `path`. On S3, requesting `kind`, `mtime`, `mode`, `uid`, or `gid`
+via `include`, or a `where` condition on fields the listing lacks, sends a
+per-object `HEAD` request; see
+[List objects](https://greaber.github.io/syq/object-storage.html#list-objects).
 
 Paths must be valid UTF-8 strings, as must symlink targets when `link_target` is
 included; to handle non-UTF-8 byte names call `run(["find", "--null", ...])`,

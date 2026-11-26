@@ -42,8 +42,7 @@ unchanged. The selected release runs the whole command, including on servers,
 so an older release brings its older limitations and bugs too. If such a
 command starts receiving or the SSH authorization provider on your laptop,
 your normal installation later switches them to its own version, [as after an
-update](persistence-reference.md#connection-lifetime-and-waits), except
-receiving that a release before 0.8.0 started. Stored
+update](persistence-reference.md#connection-lifetime-and-waits). Stored
 releases stay until you delete them; see
 [stored releases](environment.md#stored-releases-and-helpers).
 
