@@ -2218,6 +2218,12 @@ mod coordinator_argv_roundtrip {
             assert_eq!(new_s3.bucket, orig_s3.bucket, "{}", ctx());
             assert_eq!(new_s3.route, orig_s3.route, "{}", ctx());
             assert_eq!(new_s3.retries, orig_s3.retries, "{}", ctx());
+            assert_eq!(
+                new_s3.directory_markers,
+                orig_s3.directory_markers,
+                "{}",
+                ctx()
+            );
             // Signer-local S3 settings stay on the invoking machine.
             assert!(new_s3.endpoint.is_none(), "{}", ctx());
             assert!(new_s3.region.is_none(), "{}", ctx());
@@ -2567,6 +2573,7 @@ mod coordinator_argv_roundtrip {
                 "--s3-region=auto",
                 "--s3-header=x-amz-test: secret",
                 "--s3-write-header=cache-control: no-store",
+                "--s3-directory-markers=empty",
                 "--resource-limits=bandwidth=5M,s3-requests=64,s3-objects=16,s3-parts-per-object=4",
                 "--performance-tuning=s3-part-size=8M",
                 "--syq-path=/opt/syq",

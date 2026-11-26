@@ -46,6 +46,9 @@ mod executable;
 #[path = "s3/server_copies.rs"]
 mod server_copies;
 
+#[path = "s3/directory_markers.rs"]
+mod directory_markers;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},

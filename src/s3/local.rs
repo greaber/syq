@@ -212,11 +212,54 @@ pub(super) fn upload_destination(
     ))
 }
 
+pub(super) fn filter_directory_markers<T>(
+    items: &mut Vec<T>,
+    mode: super::DirectoryMarkers,
+    extra_paths: &[String],
+    selected_paths: &[String],
+    is_dir: impl Fn(&T) -> bool,
+    normalized_path: impl Fn(&T) -> &str,
+) {
+    match mode {
+        super::DirectoryMarkers::All => {}
+        super::DirectoryMarkers::None => items.retain(|item| !is_dir(item)),
+        super::DirectoryMarkers::Empty => {
+            let mut empty_dirs: std::collections::HashSet<String> = items
+                .iter()
+                .filter(|item| is_dir(item))
+                .map(|item| normalized_path(item).trim_end_matches('/'))
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !empty_dirs.is_empty() {
+                for raw in items
+                    .iter()
+                    .map(&normalized_path)
+                    .chain(selected_paths.iter().map(String::as_str))
+                    .chain(extra_paths.iter().map(String::as_str))
+                {
+                    let path = raw.trim_end_matches('/');
+                    for (slash, _) in path.match_indices('/') {
+                        empty_dirs.remove(&path[..slash]);
+                    }
+                    if empty_dirs.is_empty() {
+                        break;
+                    }
+                }
+            }
+            items.retain(|item| {
+                !is_dir(item) || empty_dirs.contains(normalized_path(item).trim_end_matches('/'))
+            });
+        }
+    }
+}
+
 pub(super) struct UploadPlan {
     pub sources: Vec<Source>,
     pub prune: super::prune::Plan,
     pub ignored: u64,
     pub excluded: u64,
+    pub single_object: Option<bool>,
 }
 
 pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
@@ -392,6 +435,16 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
             named_sources,
         ));
     }
+    let single_object = if selected.is_empty() {
+        None
+    } else if selected.len() == 1
+        && selected[0].0.kind() != ObjectKind::Dir
+        && selected[0].1 != SourceSelection::Contents
+    {
+        Some(true)
+    } else {
+        Some(false)
+    };
     for (source, selection) in selected {
         if args.delete && source.kind() == ObjectKind::Dir {
             prune.scope(source.key.as_bytes());
@@ -498,11 +551,26 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
             out.push(source);
         }
     }
+    let (mode, extra_paths) = args
+        .s3
+        .as_ref()
+        .map_or((super::DirectoryMarkers::All, &[][..]), |s3| {
+            (s3.directory_markers, s3.extra_destination_paths.as_slice())
+        });
+    filter_directory_markers(
+        &mut out,
+        mode,
+        extra_paths,
+        &[],
+        |source| source.kind() == ObjectKind::Dir,
+        |source| source.key.as_str(),
+    );
     Ok(UploadPlan {
         sources: out,
         prune,
         ignored: ignored_count,
         excluded,
+        single_object,
     })
 }
 
@@ -919,5 +987,69 @@ mod tests {
         );
         assert!(CreationPermissions::shared_for_file(&cache, &root, &path(b"other/file")).is_err());
         assert!(!cache.is_poisoned());
+    }
+
+    #[test]
+    fn filter_directory_markers_handles_nested_siblings_and_extra_paths() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Entry(&'static str, bool);
+
+        let sample = || {
+            vec![
+                Entry("a/", true),
+                Entry("a-file", false),
+                Entry("a/b/", true),
+                Entry("a/b/c/", true),
+                Entry("empty/", true),
+                Entry("with_file/", true),
+                Entry("with_file/f", false),
+                Entry("with_selected/", true),
+                Entry("with_callback/", true),
+            ]
+        };
+
+        let mut all = sample();
+        filter_directory_markers(
+            &mut all,
+            crate::s3::DirectoryMarkers::All,
+            &[],
+            &[],
+            |e| e.1,
+            |e| e.0,
+        );
+        assert_eq!(all.len(), sample().len());
+
+        let mut none = sample();
+        filter_directory_markers(
+            &mut none,
+            crate::s3::DirectoryMarkers::None,
+            &[],
+            &[],
+            |e| e.1,
+            |e| e.0,
+        );
+        assert_eq!(
+            none,
+            vec![Entry("a-file", false), Entry("with_file/f", false)]
+        );
+
+        let mut empty = sample();
+        filter_directory_markers(
+            &mut empty,
+            crate::s3::DirectoryMarkers::Empty,
+            &["with_callback/child".to_owned()],
+            &["with_selected/child".to_owned()],
+            |e| e.1,
+            |e| e.0,
+        );
+        assert_eq!(
+            empty,
+            vec![
+                Entry("a-file", false),
+                Entry("a/b/c/", true),
+                Entry("empty/", true),
+                Entry("with_file/f", false),
+            ]
+        );
     }
 }

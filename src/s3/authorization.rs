@@ -496,6 +496,8 @@ impl Signer {
             retries: 1,
             automatic_concurrency: false,
             automatic_part_size: false,
+            directory_markers: super::DirectoryMarkers::default(),
+            extra_destination_paths: Vec::new(),
         };
         let (client, credentials) =
             super::client::connect_local(&mut options, Arc::default(), Arc::default()).await?;

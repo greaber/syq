@@ -106,8 +106,7 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                     runtime.block_on(authorization.finish())?;
                 }
             } else {
-                let callback_paths = manifest.callbacks.iter().any(|e| e.dst.path().is_some());
-                run_pathname_phase(args, manifest.paths, callback_paths, &writer, totals)?;
+                run_pathname_phase(args, manifest.paths, &manifest.callbacks, &writer, totals)?;
             }
             let callbacks = Callbacks {
                 channel: &channel,
@@ -149,19 +148,33 @@ fn read_manifest(args: &Args) -> Result<manifest::Manifest> {
 }
 
 /// Copy the manifest's pathname entries as one ordinary copy, whose records
-/// join this stream and whose totals start the run's. `callback_paths` says
-/// whether callback entries also write under the destination.
+/// join this stream and whose totals start the run's. `callbacks` lets S3 empty
+/// directory-marker filtering see callback entries that share the destination.
 fn run_pathname_phase(
     args: &Args,
     paths: crate::mapping::ParsedManifest,
-    callback_paths: bool,
+    callbacks: &[Entry],
     writer: &Arc<ResultsWriter>,
     totals: &mut Totals,
 ) -> Result<()> {
     let mut ordinary = args.clone();
     ordinary.stream_mapping_fd = None;
+    let callback_paths = callbacks.iter().any(|e| e.dst.path().is_some());
     if callback_paths {
         ordinary.target_existence = Existence::Any;
+    }
+    if let Some(s3) = ordinary.s3.as_mut() {
+        if s3.directory_markers == crate::s3::DirectoryMarkers::Empty
+            && s3.route != crate::s3::Route::Download
+        {
+            let destination = &ordinary.locations.last().unwrap().path;
+            for entry in callbacks {
+                if let Some(dst) = entry.dst.path() {
+                    s3.extra_destination_paths
+                        .push(crate::s3::stream::source_key(dst, Some(destination))?);
+                }
+            }
+        }
     }
     ordinary.parsed_mapping = Some(Arc::new(paths));
     let phase = ResultsWriter::phase(writer.clone());

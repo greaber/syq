@@ -26,6 +26,7 @@ These options change that:
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 | `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects, such as storage class or server-side encryption settings; repeatable, and overrides an `--s3-header` of the same name |
+| `--s3-directory-markers MODE` | Which directories get 0-byte `dir/` markers when writing to S3: `all` (default), `empty`, or `none` |
 | `--s3-retries N` | Retry each request up to N times (0–100, default 10) after a dropped connection, a timeout, a server error or throttling; 0 disables retries |
 
 Pass customer-provided encryption key headers
@@ -41,41 +42,26 @@ service is back.
 
 ### Listing large prefixes
 
-Before it copies or removes a prefix, for `--prune`, and for `syq find`
-without `--depth`, syq lists the objects under it. When the listing needs
-more than one page and the prefix has subdirectories, syq may list parts of
-it at the same time, so the listing can finish sooner when each request takes
-a while. This costs more list requests: usually up to about a quarter more on
-large listings, or around a couple hundred more when many subdirectories look
-large at first but turn out to hold few objects.
+Before copying or removing a prefix, for `--prune`, and for `syq find` without
+`--depth`, syq lists the keys under it. When a listing spans multiple pages and
+the prefix has subdirectories, syq may split it into parallel listings, trading
+extra list requests (typically up to about a quarter more on large trees) for
+lower latency.
 
-In general purpose buckets on AWS, which return keys in byte order, syq
-divides a large listing into ranges of keys. With `--s3-endpoint`, that
-means the URL is an AWS S3 endpoint: regional, dual-stack, FIPS, or the
-bucket address of a VPC endpoint. When a prefix has no more than a few
-dozen subdirectories and the first ones hold many objects, syq may list each
-subdirectory by itself, at a request each, however few objects the others
-hold.
+In general-purpose AWS S3 buckets, keys arrive in byte order, so syq can split
+by key range as well as by subdirectory. With `--s3-endpoint`, key-range
+splitting applies only to recognized AWS S3 endpoints (regional, dual-stack,
+FIPS, or VPC bucket endpoints). Other services (such as Cloudflare R2, Google
+Cloud Storage, Backblaze B2, Tigris, and MinIO) and S3 Express directory
+buckets and their access points (`--x-s3` and `--xa-s3`) do not guarantee byte
+order, so syq splits there only by subdirectory and falls back to sequential
+listing when a prefix is flat or when the service does not return all
+subdirectories in one complete response.
 
-Other services, including Cloudflare R2, Google Cloud Storage, Backblaze B2,
-Tigris, MinIO and other servers you run yourself, do not promise that order.
-There syq asks for the prefix's subdirectories and lists each by itself;
-subdirectories whose names start the same way may share a listing. S3
-directory buckets and their access points, whose names end in `--x-s3` and
-`--xa-s3`, do not promise it either, and list only prefixes that end in a
-slash. There syq lists each subdirectory by itself, and lists a prefix with
-more than a few dozen subdirectories one page after another.
-
-Syq also lists a prefix one page after another when its subdirectories are
-small, or when the service does not name them all in one response that says
-it is complete. That happens with more than a thousand subdirectories, and a
-service may stop short with fewer.
-
-When syq copies or removes a prefix, and a bucket policy lets it list the
-prefix but not the parts it lists separately, syq lists the prefix again one
-page after another. `syq find` does the same if it has printed nothing yet;
-otherwise it fails and says to rerun with
-`--performance-tuning s3-requests=1`.
+When a bucket policy allows listing only the requested prefix and denies
+narrower prefixes, copies and removals fall back to a sequential listing.
+`syq find` does the same if nothing has printed yet; otherwise it fails and
+tells you to rerun with `--performance-tuning s3-requests=1`.
 
 ## Upload and download
 
@@ -139,8 +125,9 @@ directory's `kind`, and whether `kind` is `"dir"` use the listing alone. Other
 fields of an object, including whether it is a file or a symlink that syq
 stored, need a HEAD request for each object the listed fields haven't ruled
 out, as do `--include` `kind`, `mtime`, `mode`, `uid` and `gid`; syq sends up
-to 32 at a time. `--long` and the default `--json` fields never need a HEAD
-request for an object, and show every object as a file. Without
+to 32 at a time. `--long` and the default `--json` fields do not need a HEAD request on their
+own; without one, objects (including symlinks) print as files and directory
+markers as directories. Without
 `--s3-region`, syq also asks AWS where the bucket is, with one HEAD request
 for the bucket itself.
 
@@ -154,7 +141,16 @@ for the bucket itself.
   under the `NAME/` prefix; use `--srcs-in` for a prefix's contents. A prefix
   exists when it contains objects, including an empty directory marker.
 - **Metadata:** Uploads store each file's modification time, permissions,
-  ownership, and symlink target with the object. Downloads restore symlinks
+  ownership, and symlink target with the object. By default
+  (`--s3-directory-markers=all`), copies to S3 write a 0-byte `dir/` marker for
+  every directory so empty directories and directory permissions and
+  modification times survive downloads. Set `--s3-directory-markers=empty` to
+  write markers only for copied directories with no selected entries beneath
+  them (decided from the selected source tree before `--if-exists` or
+  `--copy-if`), or `none` to write no markers at all—for example, to save
+  requests or avoid 0-byte marker objects in other tools. Directories without a
+  marker lose their permissions and modification times on download; existing
+  destination markers for copied directories are left in place. Downloads restore symlinks
   and modification times, using the S3 Last-Modified time when an object has
   no stored time; add `--copy-metadata=permissions,ownership` to restore
   permissions and ownership too. Changing an existing object's metadata

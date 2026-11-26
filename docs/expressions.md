@@ -130,6 +130,7 @@ src.mode & 0o111 != 0
 | `timestamp("2026-09-01T00:00:00Z")` | RFC 3339 timestamp with an explicit timezone |
 | `"text"`, `'text'` | Strings; escapes are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, and `\xNN` for a byte |
 | `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=` | Exact equality, inequality, and ordering |
+| `is null`, `is not null` | Test for unavailable or absent values |
 | `and`, `or`, `not` | Boolean operations |
 | `+`, `-`, `*`, `/`, `%` | Checked arithmetic; integer division truncates toward zero |
 | `&`, `^`, `\|` | Integer bitwise operations |

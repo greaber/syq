@@ -231,13 +231,10 @@ impl Engine {
         let DownloadPlan {
             jobs: mut plan,
             mut prune,
+            single_object,
             ..
         } = self.download_plan(&target).await?;
-        self.check_upload_placement(
-            plan.first()
-                .map(|job| job.path == target && !job.key.ends_with('/')),
-        )
-        .await?;
+        self.check_upload_placement(single_object).await?;
         self.discover_destination(&mut plan, &prune.scopes, copy_destination_key)
             .await?;
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;

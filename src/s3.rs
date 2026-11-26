@@ -99,12 +99,42 @@ pub(crate) struct Flags {
     s3_retries: Option<u32>,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DirectoryMarkers {
+    /// Create 0-byte dir/ markers for every copied directory (preserves empty directories and directory metadata)
+    #[default]
+    All,
+    /// Create 0-byte dir/ markers only for copied directories with no selected entries beneath them (before --if-exists/--copy-if)
+    Empty,
+    /// Create no 0-byte dir/ markers
+    None,
+}
+
+impl DirectoryMarkers {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Empty => "empty",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Copy-only headers; removal and listing never create objects.
 #[derive(clap::Args, Debug, Default)]
 pub(crate) struct WriteFlags {
     /// Add a header to S3 requests that create or replace objects (repeatable; S3-to-S3 metadata/tag overrides are refused)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_write_header: Vec<Header>,
+    /// Which directories get 0-byte dir/ marker objects on an S3 destination
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value_t = DirectoryMarkers::All,
+        help_heading = "Object storage"
+    )]
+    s3_directory_markers: DirectoryMarkers,
 }
 
 /// Requests that create or replace an object and so carry its settings:
@@ -170,6 +200,8 @@ pub(crate) struct Options {
     pub retries: u32,
     pub automatic_concurrency: bool,
     pub automatic_part_size: bool,
+    pub directory_markers: DirectoryMarkers,
+    pub extra_destination_paths: Vec<String>,
 }
 impl Options {
     pub fn is_tigris(&self) -> bool {
@@ -255,6 +287,7 @@ impl Options {
                 "s3_profile",
                 "s3_header",
                 "s3_write_header",
+                "s3_directory_markers",
                 "s3_retries",
             ]
             .iter()
@@ -322,6 +355,15 @@ impl Options {
         if to.is_none() && !write_headers.is_empty() {
             bail!("--s3-write-header requires an S3 destination; downloads create no objects");
         }
+        if to.is_none() && explicit("s3_directory_markers") {
+            bail!("--s3-directory-markers requires an S3 destination; downloads create no objects");
+        }
+        let directory_markers = matches
+            .try_get_one::<DirectoryMarkers>("s3_directory_markers")
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or_default();
         if from.is_some() && to.is_some() {
             let headers = (flags.s3_header.iter().map(|h| ("--s3-header", h)))
                 .chain(write_headers.iter().map(|h| ("--s3-write-header", h)));
@@ -379,6 +421,8 @@ impl Options {
             concurrency,
             part_size,
             retries: flags.s3_retries.unwrap_or(DEFAULT_RETRIES),
+            directory_markers,
+            extra_destination_paths: Vec::new(),
         }))
     }
 }
@@ -593,5 +637,79 @@ mod write_header_tests {
                 "{method} {query:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod directory_marker_tests {
+    use super::DirectoryMarkers;
+    use crate::cli::Args;
+    use std::ffi::OsString;
+
+    fn parse(words: &[&str]) -> anyhow::Result<Args> {
+        let words: Vec<OsString> = words.iter().map(OsString::from).collect();
+        Args::parse_args(&words)
+    }
+
+    #[test]
+    fn cli_validates_s3_directory_markers_destination_and_mode() {
+        let default_upload = parse(&["cp", "src", "--to", "s3://bucket", "--into", "dst"]).unwrap();
+        assert_eq!(
+            default_upload.s3.as_ref().unwrap().directory_markers,
+            DirectoryMarkers::All
+        );
+
+        for (mode_arg, expected) in [
+            ("all", DirectoryMarkers::All),
+            ("empty", DirectoryMarkers::Empty),
+            ("none", DirectoryMarkers::None),
+        ] {
+            let flag = format!("--s3-directory-markers={mode_arg}");
+            let upload =
+                parse(&["cp", "src", "--to", "s3://bucket", "--into", "dst", &flag]).unwrap();
+            assert_eq!(upload.s3.as_ref().unwrap().directory_markers, expected);
+
+            let server_copy = parse(&[
+                "cp", "--from", "s3://src", "a", "--to", "s3://dst", "--into", "out", &flag,
+            ])
+            .unwrap();
+            assert_eq!(server_copy.s3.as_ref().unwrap().directory_markers, expected);
+
+            let download =
+                parse(&["cp", "--from", "s3://bucket", "a", "--into", "dst", &flag]).unwrap_err();
+            assert!(
+                download
+                    .to_string()
+                    .contains("--s3-directory-markers requires an S3 destination"),
+                "{download:#}"
+            );
+        }
+
+        let no_s3 =
+            parse(&["cp", "src", "--into", "dst", "--s3-directory-markers=empty"]).unwrap_err();
+        assert!(
+            no_s3
+                .to_string()
+                .contains("S3 options require --from s3://BUCKET or --to s3://BUCKET"),
+            "{no_s3:#}"
+        );
+
+        let descriptor = parse(&[
+            "cp",
+            "--src-fd",
+            "3",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "obj",
+            "--s3-directory-markers=none",
+        ]);
+        assert!(descriptor.is_err());
+        let err = descriptor.err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("--s3-directory-markers is not supported with descriptor copies"),
+            "{err:#}"
+        );
     }
 }

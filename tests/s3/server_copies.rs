@@ -693,3 +693,28 @@ fn options_these_copies_cannot_honor_are_refused() {
     }
     assert_eq!(lab.requests(), "");
 }
+
+#[test]
+fn server_upload_honors_s3_directory_markers() {
+    let lab = Lab::start("ok");
+    std::fs::create_dir(lab.path("server-home/dataset/empty_dir")).unwrap();
+    let output = lab.run(&[UPLOAD, &["--s3-directory-markers=empty"]].concat());
+    assert!(output.status.success(), "{}", output_text(&output));
+    let requests = lab.requests();
+    assert!(
+        requests.contains("PUT /bucket/backup/empty_dir/\n"),
+        "{requests}"
+    );
+    assert!(
+        !requests.contains("PUT /bucket/backup/sub/\n"),
+        "{requests}"
+    );
+    assert_eq!(
+        std::fs::read(lab.path("stored-by-fixture/a")).unwrap(),
+        b"first\n"
+    );
+    assert_eq!(
+        std::fs::read(lab.path("stored-by-fixture/b")).unwrap(),
+        b"second\n"
+    );
+}

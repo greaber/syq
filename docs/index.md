@@ -3,7 +3,7 @@
 <span class="landing-subtitle">Fast, programmable file transfer.</span>
 </h1>
 
-Copy, reorganize, and remove files across local filesystems, remote machines,
+Copy, list, reorganize, and remove files across local filesystems, remote machines,
 and S3-compatible storage. Choose which files to copy and
 where they should land, preview the changes, and rerun interrupted copies to resume.
 
@@ -60,6 +60,7 @@ updated when they differ, and other files there stay unless you add
 | Preview changes | [Preview changes](copy-files.md#preview-changes) |
 | Skip build files or use `.gitignore` | [Ignoring paths](copy-files.md#ignoring-paths) |
 | Mirror a directory | [Mirror a directory](copy-files.md#mirror-a-directory) |
+| Find or list files locally, on SSH, or in S3 | [`syq find`](commands/find.md) and [`syq ls`](commands/ls.md) |
 | Remove files in parallel | [Remove files](remove.md) |
 | Send files to my laptop from a server’s shell | [Use your laptop from a server](receive.md) |
 | Run a build or open an artifact on my desktop from a server | [Run commands on your laptop](receive.md#run-commands-on-your-laptop) |

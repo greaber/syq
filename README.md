@@ -2,7 +2,7 @@
 
 Fast, programmable file transfer.
 
-Syq (pronounced "sick") copies, reorganizes, and removes files across local
+Syq (pronounced "sick") copies, lists, reorganizes, and removes files across local
 filesystems, remote machines, and S3-compatible storage.
 It aims to perform well across file sizes, directory sizes, and network speeds.
 
@@ -17,6 +17,7 @@ Quick links to docs for common tasks:
 - [Run commands on your laptop from a server](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop)
 - [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
 - [Copy to, from, and between S3-compatible buckets](https://greaber.github.io/syq/object-storage.html)
+- [Find and list files locally, over SSH, or in S3](https://greaber.github.io/syq/commands/find.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
 - Script syq using [structured results](https://greaber.github.io/syq/automation.html)
   or the [Python SDK](https://greaber.github.io/syq/python.html).

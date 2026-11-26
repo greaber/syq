@@ -235,8 +235,15 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     "Progress and results"
                 }
                 "include" if map => "Output fields",
-                "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header"
-                | "s3_retries" | "s3_all_versions" | "s3_version_id"
+                "s3_endpoint"
+                | "s3_region"
+                | "s3_profile"
+                | "s3_header"
+                | "s3_write_header"
+                | "s3_directory_markers"
+                | "s3_retries"
+                | "s3_all_versions"
+                | "s3_version_id"
                     if map || rm =>
                 {
                     "Object storage"
@@ -376,7 +383,12 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         | "peer_auth"
         | "receiver_max_entries"
         | "receiver_max_bytes" => ("Connections and remote execution", 5),
-        "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header"
+        "s3_endpoint"
+        | "s3_region"
+        | "s3_profile"
+        | "s3_header"
+        | "s3_write_header"
+        | "s3_directory_markers"
         | "s3_retries" => ("S3 connection settings", 6),
         "performance_tuning" | "resource_limits_arg" | "transfer_strategy" => {
             ("Performance and resource limits", 7)

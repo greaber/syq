@@ -602,6 +602,7 @@ class NativeClientTests(unittest.TestCase):
                        s3_endpoint="https://storage.example", s3_region="auto",
                        s3_profile="archive", auth_from="@laptop", s3_header=["X-Policy: a:b", "X-Other: yes"],
                        s3_retries=2, s3_write_header=["x-amz-storage-class: STANDARD_IA"],
+                       s3_directory_markers="empty",
                        performance_tuning="s3-parts-per-object=7,s3-part-size=64M",
                        resource_limits="s3-requests=16,s3-objects=4")
         argv = self.argv()
@@ -609,14 +610,23 @@ class NativeClientTests(unittest.TestCase):
         for expected in ["--s3-endpoint=https://storage.example", "--s3-region=auto",
                          "--s3-profile=archive", "--s3-header=X-Policy: a:b",
                          "--s3-header=X-Other: yes", "--s3-retries=2",
-                         "--s3-write-header=x-amz-storage-class: STANDARD_IA", "--resource-limits",
+                         "--s3-write-header=x-amz-storage-class: STANDARD_IA",
+                         "--s3-directory-markers=empty", "--resource-limits",
                          "s3-requests=16,s3-objects=4", "--performance-tuning",
                          "s3-parts-per-object=7,s3-part-size=64M"]:
             self.assertIn(expected, argv)
+        for mode in ("all", "empty", "none"):
+            self.client.cp("source", to="s3://bucket", into="prefix", s3_directory_markers=mode)
+            self.assertIn(f"--s3-directory-markers={mode}", self.argv())
+        self.client.cp("source", to="s3://bucket", into="prefix")
+        self.assertFalse(any(arg.startswith("--s3-directory-markers") for arg in self.argv()))
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp("source", to="s3://bucket", into="prefix", s3_header="X: value")
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp("source", to="s3://bucket", into="prefix", s3_write_header="X: value")
+        for bad in ("invalid", 123, True):
+            with self.subTest(bad=bad), self.assertRaisesRegex(syq.SyqInvocationError, "s3_directory_markers"):
+                self.client.cp("source", to="s3://bucket", into="prefix", s3_directory_markers=bad)
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp("source", to="s3://bucket", into="prefix", performance_tuning=True)
 
