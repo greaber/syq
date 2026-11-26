@@ -634,13 +634,26 @@ def _s3_arguments(
         argv.append(f"--s3-retries={retries}")
 
 
-def _s3_write_arguments(argv: list[Argument], headers: Iterable[str] | None) -> None:
-    if headers is None:
-        return
-    if isinstance(headers, (str, bytes)):
-        raise SyqInvocationError("s3_write_header must be an iterable of header strings")
-    for header in headers:
-        argv.append("--s3-write-header=" + _text_arg(header, label="s3_write_header"))
+def _s3_write_arguments(
+    argv: list[Argument],
+    headers: Iterable[str] | None,
+    directory_markers: str | None = None,
+) -> None:
+    if headers is not None:
+        if isinstance(headers, (str, bytes)):
+            raise SyqInvocationError("s3_write_header must be an iterable of header strings")
+        for header in headers:
+            argv.append("--s3-write-header=" + _text_arg(header, label="s3_write_header"))
+    if directory_markers is not None:
+        if not isinstance(directory_markers, str) or directory_markers not in {
+            "all",
+            "empty",
+            "none",
+        }:
+            raise SyqInvocationError(
+                "s3_directory_markers must be 'all', 'empty', or 'none'"
+            )
+        argv.append(f"--s3-directory-markers={directory_markers}")
 
 
 def _warn_unsupported_copy_options(*, only_existing=False,
@@ -1530,6 +1543,7 @@ class Client:
         s3_header: Iterable[str] | None = None,
         s3_retries: int | None = None,
         s3_write_header: Iterable[str] | None = None,
+        s3_directory_markers: str | None = None,
         auth_from: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
@@ -1612,7 +1626,7 @@ class Client:
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header, s3_retries)
-        _s3_write_arguments(argv, s3_write_header)
+        _s3_write_arguments(argv, s3_write_header, s3_directory_markers)
         if connection.auth_from is not None:
             argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
         _append_remote_arguments(

@@ -1802,6 +1802,12 @@ pub(crate) fn coordinator_arguments(
         // profile and headers stay here: its signer applies them, and the
         // headers reach the coordinator on the signing session.
         remote.push(format!("--s3-retries={}", storage.retries));
+        if !coordinator_at_dst && storage.directory_markers != crate::s3::DirectoryMarkers::All {
+            remote.push(format!(
+                "--s3-directory-markers={}",
+                storage.directory_markers.as_str()
+            ));
+        }
     } else {
         append_delegated_helper_selection(
             &mut remote,

@@ -922,6 +922,7 @@ class AsyncClient:
         s3_header: Iterable[str] | None = None,
         s3_retries: int | None = None,
         s3_write_header: Iterable[str] | None = None,
+        s3_directory_markers: str | None = None,
         auth_from: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
@@ -1006,7 +1007,7 @@ class AsyncClient:
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header, s3_retries)
-        _s3_write_arguments(argv, s3_write_header)
+        _s3_write_arguments(argv, s3_write_header, s3_directory_markers)
         if connection.auth_from is not None:
             argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
         _append_remote_arguments(

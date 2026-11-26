@@ -166,6 +166,7 @@ struct DownloadPlan {
     // Aligned with jobs when requested; empty otherwise, so ordinary copies
     // do not retain an extra timestamp per object.
     service_times: Vec<Option<(i64, u32)>>,
+    single_object: Option<bool>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -418,6 +419,7 @@ impl Engine {
                 mut prune,
                 ignored,
                 excluded,
+                single_object,
             } = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             self.progress.paths_ignored.fetch_add(ignored, Relaxed);
             self.progress.files_excluded.fetch_add(excluded, Relaxed);
@@ -428,8 +430,7 @@ impl Engine {
                         .filter_map(|s| s.metadata.map(|m| (s.key.as_bytes().to_vec(), m))),
                 );
             }
-            self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
-                .await?;
+            self.check_upload_placement(single_object).await?;
             self.discover_destination(&mut plan, &prune.scopes, |source| {
                 source.key.as_str().into()
             })
@@ -572,6 +573,7 @@ impl Engine {
                 jobs: mut plan,
                 mut prune,
                 service_times,
+                single_object: _,
             } = self.download_plan(&destination.prefix).await?;
             self.authorize_downloads(&mut plan).await?;
             self.finish_authorization().await?;
@@ -2159,6 +2161,10 @@ impl Engine {
             .source_bucket()
             .unwrap_or(&self.options.bucket);
         let mut out = Vec::new();
+        let mut undecided_where = Vec::new();
+        let mut selected_paths = Vec::new();
+        let mut selector_count = 0usize;
+        let mut first_exact_non_dir = false;
         let mut service_times = Vec::new();
         let retain_times =
             !self.options.route.is_server_copy() && self.args.expressions.uses_source_s3_time();
@@ -2253,6 +2259,16 @@ impl Engine {
                 (exact.await?, None)
             };
             let from_listing = self.args.native_mapping.is_none() && exact.is_none();
+            selector_count += 1;
+            if selector_count == 1
+                && !contents
+                && exact
+                    .as_ref()
+                    .is_some_and(|object| !client::is_directory_marker(&object.key, object.size))
+                && path == destination_prefix
+            {
+                first_exact_non_dir = true;
+            }
             if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
@@ -2468,21 +2484,26 @@ impl Engine {
                     .args
                     .expressions
                     .selects_known(facts, expression_path.as_bytes())?;
-                if selected == Some(false)
-                    || (selected == Some(true)
-                        && self.args.expressions.permits_known(
-                            facts,
-                            expression_path.as_bytes(),
-                            crate::expression::Facts::Unread,
-                            expression_destination_path.as_bytes(),
-                        )? == Some(false))
+                if selected == Some(false) {
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
+                if selected == Some(true)
+                    && self.args.expressions.permits_known(
+                        facts,
+                        expression_path.as_bytes(),
+                        crate::expression::Facts::Unread,
+                        expression_destination_path.as_bytes(),
+                    )? == Some(false)
                 {
+                    selected_paths.push(path);
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
                 }
                 if retain_times {
                     service_times.push(service_time);
                 }
+                undecided_where.push(selected.is_none());
                 out.push(Download {
                     expression_path,
                     expression_destination_path,
@@ -2508,17 +2529,145 @@ impl Engine {
         if same_bucket {
             server_copy::check_overlap(&copy_sources, &copy_targets)?;
         }
+        if self.options.route.is_server_copy() {
+            if self.options.directory_markers == super::DirectoryMarkers::Empty
+                && undecided_where.iter().any(|&undecided| undecided)
+            {
+                self.resolve_empty_marker_candidates(
+                    source_bucket,
+                    &mut out,
+                    &undecided_where,
+                    &mut selected_paths,
+                )
+                .await?;
+            }
+            local::filter_directory_markers(
+                &mut out,
+                self.options.directory_markers,
+                &self.options.extra_destination_paths,
+                &selected_paths,
+                |job| job.kind == ObjectKind::Dir,
+                |job| job.path.as_str(),
+            );
+        }
         if let Some(results) = self.progress.results_writer() {
             results.mapping_metadata(
                 out.iter()
                     .filter_map(|j| j.metadata().map(|m| (j.path.as_bytes().to_vec(), m))),
             );
         }
+        let single_object = if selector_count == 0 {
+            None
+        } else if selector_count == 1 && first_exact_non_dir {
+            Some(true)
+        } else {
+            Some(false)
+        };
         Ok(DownloadPlan {
             jobs: out,
             prune,
             service_times,
+            single_object,
         })
+    }
+
+    async fn resolve_empty_marker_candidates(
+        &self,
+        source_bucket: &str,
+        out: &mut Vec<Download>,
+        undecided_where: &[bool],
+        selected_paths: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut dir_paths = std::collections::BTreeSet::new();
+        let mut known_children = std::collections::BTreeSet::new();
+        for (job, &undecided) in out.iter().zip(undecided_where) {
+            let path = job.path.trim_end_matches('/');
+            if path.is_empty() {
+                continue;
+            }
+            if job.kind == ObjectKind::Dir {
+                dir_paths.insert(path.to_owned());
+                known_children.insert(path.to_owned());
+            } else if !undecided {
+                known_children.insert(path.to_owned());
+            }
+        }
+        if dir_paths.is_empty() {
+            return Ok(());
+        }
+        for path in selected_paths
+            .iter()
+            .chain(&self.options.extra_destination_paths)
+        {
+            let path = path.trim_end_matches('/');
+            if !path.is_empty() {
+                known_children.insert(path.to_owned());
+            }
+        }
+        let candidate_dirs: std::collections::BTreeSet<String> = dir_paths
+            .into_iter()
+            .filter(|dir| {
+                let prefix = format!("{dir}/");
+                !known_children
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|key| key.starts_with(&prefix))
+            })
+            .collect();
+        if candidate_dirs.is_empty() {
+            return Ok(());
+        }
+        let to_check: Vec<(usize, String, String)> = out
+            .iter()
+            .zip(undecided_where)
+            .enumerate()
+            .filter_map(|(idx, (job, &undecided))| {
+                if !undecided || job.kind == ObjectKind::Dir {
+                    return None;
+                }
+                let has_candidate_ancestor = job
+                    .path
+                    .match_indices('/')
+                    .any(|(slash, _)| candidate_dirs.contains(&job.path[..slash]));
+                has_candidate_ancestor.then(|| (idx, job.key.clone(), job.expression_path.clone()))
+            })
+            .collect();
+        if to_check.is_empty() {
+            return Ok(());
+        }
+        let lookups: Vec<_> = stream::iter(to_check.into_iter().map(
+            |(idx, key, expr_path)| async move {
+                self.check_cancelled()?;
+                let fetched = self.copy_head(source_bucket, &key, false).await?;
+                let Some((source, head)) = fetched else {
+                    return Ok::<_, anyhow::Error>((idx, None));
+                };
+                let keep = self
+                    .args
+                    .expressions
+                    .selects(&source.expression_file(), expr_path.as_bytes())?;
+                Ok((idx, Some((source, head, keep))))
+            },
+        ))
+        .buffer_unordered(32)
+        .collect()
+        .await;
+        let mut keep_slot = vec![true; out.len()];
+        for entry in lookups {
+            let (idx, resolved) = entry?;
+            if let Some((source, head, keep)) = resolved {
+                if keep {
+                    out[idx].copy_source = Some(Box::new((source, head)));
+                    selected_paths.push(out[idx].path.clone());
+                } else {
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    keep_slot[idx] = false;
+                }
+            }
+        }
+        let mut iter = keep_slot.into_iter();
+        out.retain(|_| iter.next().unwrap());
+        Ok(())
     }
     async fn download(
         self: &Arc<Self>,

@@ -58,6 +58,7 @@
         "s3-header",
         "s3-retries",
         "s3-write-header",
+        "s3-directory-markers",
         "performance-tuning",
         "resource-limits",
         "integrity-checking",

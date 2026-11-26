@@ -110,6 +110,7 @@ what they do.
 | `s3_endpoint`, `s3_region`, `s3_profile` | S3 endpoint URL, signing region, and AWS profile |
 | `s3_header` | Iterable of `"NAME: VALUE"` headers added before signing to every S3 request |
 | `s3_write_header` | Like `s3_header`, but only on requests that create or replace objects |
+| `s3_directory_markers` | `"all"` (default), `"empty"`, or `"none"`: which directories get 0-byte `dir/` markers on an S3 destination |
 | `s3_retries` | Retries per S3 request after a temporary failure or throttling, 0 to 100; default 10 |
 | `coordinate_at`, `rsh`, `peer_auth` | As `--coordinate-at`, `--rsh`, and `--peer-auth` |
 | `pscope` | A [persistence scope](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes) for connections and saved authorization choices |

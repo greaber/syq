@@ -134,3 +134,130 @@ class RemoteMappingTests(unittest.TestCase):
             ], from_="s3://bucket", into="output", s3_endpoint=source.endpoint, s3_region="us-east-1")
             self.assertEqual((root / "output/ordinary").read_bytes(), b"source bytes")
             self.assertEqual(received, [b"source bytes"])
+
+    def test_mixed_stream_mapping_s3_directory_markers(self):
+        class UploadStore:
+            def __init__(self) -> None:
+                self.objects: dict[str, bytes] = {}
+                owner = self
+
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def log_message(self, *args):
+                        pass
+
+                    def reply(self, code: int, body: bytes = b"", headers=()):
+                        self.send_response(code)
+                        self.send_header("Content-Length", str(len(body)))
+                        for key, value in headers:
+                            self.send_header(key, value)
+                        self.end_headers()
+                        if self.command != "HEAD":
+                            self.wfile.write(body)
+
+                    def do_HEAD(self):
+                        key = urllib.parse.unquote(
+                            urllib.parse.urlsplit(self.path).path.removeprefix("/bucket/")
+                        )
+                        if key in owner.objects:
+                            self.reply(
+                                200,
+                                headers=[
+                                    ("Content-Length", str(len(owner.objects[key]))),
+                                    ("ETag", '"e"'),
+                                    ("Last-Modified", "Thu, 01 Jan 2026 00:00:00 GMT"),
+                                ],
+                            )
+                        else:
+                            self.reply(404)
+
+                    def do_GET(self):
+                        if "list-type=2" in self.path:
+                            self.reply(
+                                200,
+                                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                            )
+                        else:
+                            self.reply(404)
+
+                    def do_PUT(self):
+                        length = int(self.headers.get("Content-Length", "0"))
+                        data = self.rfile.read(length) if length else b""
+                        key = urllib.parse.unquote(
+                            urllib.parse.urlsplit(self.path).path.removeprefix("/bucket/")
+                        )
+                        owner.objects[key] = data
+                        self.reply(200, headers=[("ETag", '"e"')])
+
+                self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                self.thread = threading.Thread(target=self.server.serve_forever)
+                self.thread.start()
+                self.endpoint = f"http://127.0.0.1:{self.server.server_port}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.server.shutdown()
+                self.server.server_close()
+                self.thread.join(timeout=5)
+
+        def write_stream(out):
+            out.write(b"callback payload")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "dir_with_cb").mkdir()
+            (root / "truly_empty").mkdir()
+            env = os.environ | {
+                "AWS_ACCESS_KEY_ID": "fixture",
+                "AWS_SECRET_ACCESS_KEY": "fixture",
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "AWS_CONFIG_FILE": str(root / "no-config"),
+                "AWS_SHARED_CREDENTIALS_FILE": str(root / "no-credentials"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS": "1",
+            }
+            for key in ("AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"):
+                env.pop(key, None)
+            client = syq.Client(
+                executable=os.environ["SYQ_CANDIDATE_EXECUTABLE"],
+                process_cwd=root,
+                env=env,
+                timeout=10,
+            )
+
+            with UploadStore() as store_empty:
+                client.cp(
+                    mapping=[
+                        syq.MappingEntry("dir_with_cb", "dir_with_cb"),
+                        syq.MappingEntry("truly_empty", "truly_empty"),
+                        syq.MappingEntry(syq.StreamSource(write_stream), "dir_with_cb/child.txt"),
+                    ],
+                    to="s3://bucket",
+                    into="dst",
+                    s3_endpoint=store_empty.endpoint,
+                    s3_region="us-east-1",
+                    s3_directory_markers="empty",
+                )
+                self.assertEqual(
+                    set(store_empty.objects),
+                    {"dst/dir_with_cb/child.txt", "dst/truly_empty/"},
+                )
+
+            with UploadStore() as store_none:
+                client.cp(
+                    mapping=[
+                        syq.MappingEntry("dir_with_cb", "dir_with_cb"),
+                        syq.MappingEntry("truly_empty", "truly_empty"),
+                        syq.MappingEntry(syq.StreamSource(write_stream), "dir_with_cb/child.txt"),
+                    ],
+                    to="s3://bucket",
+                    into="dst",
+                    s3_endpoint=store_none.endpoint,
+                    s3_region="us-east-1",
+                    s3_directory_markers="none",
+                )
+                self.assertEqual(
+                    set(store_none.objects),
+                    {"dst/dir_with_cb/child.txt"},
+                )
