@@ -57,6 +57,24 @@ if command == "map":
         "kind": "file", "size": 3, "mtime": 100,
     }))
     raise SystemExit(int(os.environ.get("SYQ_FAKE_EXIT", "0")))
+if command in {"find", "ls"}:
+    shape = os.environ.get("SYQ_FAKE_SHAPE")
+    if shape == "oversized-line":
+        sys.stdout.buffer.write(b"x" * (16 * 1024 * 1024 + 1))
+        sys.stdout.buffer.flush()
+        raise SystemExit(0)
+    if shape == "bad-find-json":
+        sys.stdout.buffer.write(b"{not-json\n")
+        sys.stdout.buffer.flush()
+        raise SystemExit(0)
+    entries = os.environ.get("SYQ_FAKE_FIND_ENTRIES")
+    if entries is None:
+        print(json.dumps({"path": "a.txt", "kind": "file", "size": 3, "mtime": 100}))
+    else:
+        for entry in json.loads(entries):
+            print(json.dumps(entry))
+    sys.stdout.flush()
+    raise SystemExit(int(os.environ.get("SYQ_FAKE_EXIT", "0")))
 
 results_fd_arg = next(arg for arg in args if arg.startswith("--results-fd="))
 machine_output = os.fdopen(

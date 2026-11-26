@@ -1980,6 +1980,7 @@ mod coordinator_argv_roundtrip {
             native_map_root,
             native_map_target,
             native_map_include,
+            native_find,
             mapping_contents,
             native_results,
             native_results_fd,
@@ -2265,6 +2266,7 @@ mod coordinator_argv_roundtrip {
         assert!(native_map_root.is_none());
         assert!(native_map_target.is_none());
         assert!(native_map_include.is_empty());
+        assert!(native_find.is_none());
         assert!(mapping_contents.is_none());
         assert!(native_results.is_none());
         assert!(native_results_fd.is_none());

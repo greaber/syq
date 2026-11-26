@@ -30,6 +30,9 @@ class ErrorAndTimeoutTests(unittest.TestCase):
         if command == "map":
             with client.map("source", **options) as mapping:
                 return list(mapping)
+        if command in {"find", "ls"}:
+            with getattr(client, command)("source", **options) as stream:
+                return list(stream)
         if command == "run":
             return client.run(["map", "source"], **options)
         if command == "cp":
@@ -38,7 +41,7 @@ class ErrorAndTimeoutTests(unittest.TestCase):
 
     def test_omitted_timeout_inherits_none_disables_and_number_overrides(self):
         client = syq.Client(executable=self.executable, env=self.env, timeout=0)
-        for command in ("cp", "rm", "map", "run"):
+        for command in ("cp", "rm", "map", "find", "ls", "run"):
             with self.subTest(command=command):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     self.call(client, command)
@@ -94,10 +97,13 @@ class ErrorAndTimeoutTests(unittest.TestCase):
 
 class AsyncTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_unstarted_stream_has_no_self_reference_cycle(self):
-        stream = syq.AsyncClient().map("source")
-        reference = weakref.ref(stream)
-        del stream
-        self.assertIsNone(reference())
+        client = syq.AsyncClient()
+        for factory in (client.map, client.find, client.ls):
+            with self.subTest(factory=factory.__name__):
+                stream = factory("source")
+                reference = weakref.ref(stream)
+                del stream
+                self.assertIsNone(reference())
 
     async def test_timeout_overrides_for_all_async_operations(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,12 +116,15 @@ class AsyncTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 if command == "map":
                     async with client.map("source", **options) as mapping:
                         return [entry async for entry in mapping]
+                if command in {"find", "ls"}:
+                    async with getattr(client, command)("source", **options) as stream:
+                        return [entry async for entry in stream]
                 if command == "run":
                     return await client.run(["map", "source"], **options)
                 if command == "cp":
                     return await client.cp("source", into="destination", **options)
                 return await client.rm("source", **options)
-            for command in ("cp", "rm", "map", "run"):
+            for command in ("cp", "rm", "map", "find", "ls", "run"):
                 with self.subTest(command=command):
                     with self.assertRaises(asyncio.TimeoutError):
                         await call(command)

@@ -275,6 +275,23 @@ class MappingEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class FindEntry:
+    """One entry reported by ``syq find`` or ``syq ls``."""
+
+    path: str
+    kind: str | None = None
+    size: int | None = None
+    mtime: int | None = None
+    s3_last_modified: int | None = None
+    etag: str | None = None
+    mode: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    ctime: int | None = None
+    link_target: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class IgnoreFrom:
     """An ordered ``--ignore-from`` occurrence in an ``ignore`` stream."""
 

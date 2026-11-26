@@ -13,11 +13,12 @@
 
 <!-- ANCHOR: operations -->
 
-The module functions `syq.cp`, `syq.rm`, `syq.map`, `syq.open_reader`, and
-`syq.open_writer` use a default `Client`; create your own client to share
-settings across calls. `AsyncClient` takes the same arguments and returns the
-same types. Await its operations, except `map`, `open_reader`, and
-`open_writer`, which return async context managers.
+The module functions `syq.cp`, `syq.rm`, `syq.map`, `syq.find`, `syq.ls`,
+`syq.open_reader`, and `syq.open_writer` use a default `Client`; create your
+own client to share settings across calls. `AsyncClient` takes the same
+arguments and returns the same types. Await its operations, except `map`,
+`find`, `ls`, `open_reader`, and `open_writer`, which return async context
+managers.
 
 <a id="synchrony-asyncio-and-resource-ownership"></a>
 
@@ -252,6 +253,54 @@ and `auth_from="@NAME"` work as on `cp`. In a versioned bucket,
 the selected keys, and `s3_version_id="ID"` removes one version of one exact
 key; use at most one of them.
 <!-- ANCHOR_END: removal -->
+
+<!-- ANCHOR: listing -->
+<a id="listing"></a>
+
+## find and ls
+
+`find(*paths, **options) → FindStream` lists files and directories locally, on an
+SSH server (`on="server"`), or in an S3 bucket (`on="s3://bucket"`);
+`ls(*paths, **options) → FindStream` defaults `depth` to `1`. See
+[`syq find`](https://greaber.github.io/syq/commands/find.html) and
+[`syq ls`](https://greaber.github.io/syq/commands/ls.html) for listing rules.
+
+They accept `on`, `cwd`, `root`, `follow`, `follow_src`, `depth`, `ignore`,
+`ignore_from`, `where`, `include`, `performance_tuning`, `rsh`, `syq_path`,
+`no_bootstrap`, `auth_from`, `pscope`, `s3_endpoint`, `s3_region`, `s3_profile`,
+`s3_header`, `s3_retries`, and `timeout`.
+
+Use a `FindStream` in a `with` block and an `AsyncFindStream` in `async with`.
+Iterating to the end checks that the listing succeeded and raises
+`SyqProtocolError` if the listing failed or was incomplete; leaving the block
+early stops the listing. Streams cannot be reused after closing or exhaustion.
+
+Each item is a frozen `FindEntry` dataclass:
+
+```python
+path: str
+kind: str | None = None
+size: int | None = None
+mtime: int | None = None
+s3_last_modified: int | None = None
+etag: str | None = None
+mode: int | None = None
+uid: int | None = None
+gid: int | None = None
+ctime: int | None = None
+link_target: str | None = None
+```
+
+By default, `include` is `None`: filesystem listings populate `kind`, `size`
+(omitted for directories), and `mtime`, and S3 listings populate `kind`, `size`,
+`s3_last_modified`, and `etag` without per-object `HEAD` requests. Pass
+`include` with field names (such as `["kind", "mode", "link_target"]`) to
+select specific fields after `path`; asking for S3 `kind`, `mtime`, `mode`,
+`uid`, or `gid` via `include` sends a `HEAD` request per object.
+
+Paths and symlink targets must be valid UTF-8 strings; to handle non-UTF-8 byte
+names or `--long` output, call `run(["find", "--null", ...])`.
+<!-- ANCHOR_END: listing -->
 
 <!-- ANCHOR: mappings -->
 <a id="complete-input-guarantee"></a>

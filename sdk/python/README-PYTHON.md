@@ -4,9 +4,9 @@
 
 # Python
 
-The `syq` package runs syq from Python. Copy, remove, and reorganize files,
-and get typed results and events back, with a synchronous or asyncio client.
-The [operations reference](https://greaber.github.io/syq/python-operations.html)
+The `syq` package runs syq from Python. Copy, list, remove, and reorganize
+files, and get typed results and events back, with a synchronous or asyncio
+client. The [operations reference](https://greaber.github.io/syq/python-operations.html)
 lists every argument.
 
 <a id="preview-a-copy"></a>
@@ -114,6 +114,25 @@ Positional paths and `src` refuse directories; use `src_dir` to remove a tree
 or `srcs_in` to empty it. `root` keeps removal inside that directory. Pass
 `on="server"` or `on="s3://bucket"` to remove files elsewhere; see
 [Remove files](https://greaber.github.io/syq/remove.html).
+
+## List files
+
+Stream matching files and directories locally, on an SSH server, or in an S3
+bucket:
+
+```python
+with syq.ls("photos", on="s3://backups") as entries:
+    for entry in entries:
+        print(entry.path, entry.kind, entry.size)
+
+with syq.find("src", where='extension = "rs" and size > 10KiB') as entries:
+    paths = [entry.path for entry in entries]
+```
+
+See [`syq find`](https://greaber.github.io/syq/commands/find.html) and
+[`syq ls`](https://greaber.github.io/syq/commands/ls.html) for options and
+[the operations reference](https://greaber.github.io/syq/python-operations.html#find-and-ls)
+for `FindEntry` fields.
 
 ## Handle failures
 
@@ -235,7 +254,8 @@ async def main():
 asyncio.run(main())
 ```
 
-Use mappings with `async with`, without `await` before `client.map()`:
+Use mappings and listings with `async with`, without `await` before
+`client.map()`, `client.find()`, or `client.ls()`:
 
 ```python
 async def copy_photos():

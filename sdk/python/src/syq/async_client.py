@@ -39,6 +39,7 @@ from .client import (
     _append_remote_arguments,
     _argument,
     _copy_arguments,
+    _find_arguments,
     _s3_arguments,
     _s3_write_arguments,
     _insert_mapping_option,
@@ -62,12 +63,13 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    FindEntry,
     MappingEntry,
     OperationStatus,
     OperationSummary,
     RmResult,
 )
-from .protocol import AutomationDecoder, parse_mapping_line
+from .protocol import AutomationDecoder, parse_find_line, parse_mapping_line
 
 
 AsyncEventCallback = Callable[[AutomationEvent], object | Awaitable[object]]
@@ -417,6 +419,33 @@ class _AsyncLineProcess:
             self._output_transport = None
 
 
+async def _next_async_stream_entry(
+    process: _AsyncLineProcess,
+    command: str,
+    parse: Callable[[bytes], _T],
+) -> _T:
+    try:
+        line = await process.next_line()
+        if line is None:
+            returncode = await process.finish()
+            if returncode != 0:
+                raise SyqProtocolError(
+                    f"syq {command} exited with status {returncode}",
+                    returncode=returncode,
+                    stderr=process.stderr,
+                )
+            raise StopAsyncIteration
+        return parse(line)
+    except StopAsyncIteration:
+        raise
+    except BaseException as error:
+        await process.abort()
+        if isinstance(error, SyqProtocolError):
+            error.returncode = process.returncode
+            error.stderr = process.stderr
+        raise
+
+
 class AsyncMapStream(AsyncMapping):
     """A lazy, context-managed, streaming ``syq map`` result."""
 
@@ -463,26 +492,9 @@ class AsyncMapStream(AsyncMapping):
             raise StopAsyncIteration
         process = await self._ensure_started()
         try:
-            line = await process.next_line()
-            if line is None:
-                returncode = await process.finish()
-                self._complete = True
-                if returncode != 0:
-                    raise SyqProtocolError(
-                        f"syq map exited with status {returncode}",
-                        returncode=returncode,
-                        stderr=process.stderr,
-                    )
-                raise StopAsyncIteration
-            return parse_mapping_line(line)
-        except StopAsyncIteration:
-            raise
-        except BaseException as error:
-            await process.abort()
+            return await _next_async_stream_entry(process, "map", parse_mapping_line)
+        except BaseException:
             self._complete = True
-            if isinstance(error, SyqProtocolError):
-                error.returncode = process.returncode
-                error.stderr = process.stderr
             raise
 
     async def aclose(self) -> None:
@@ -493,6 +505,67 @@ class AsyncMapStream(AsyncMapping):
         self._complete = True
 
     async def __aenter__(self) -> AsyncMapStream:
+        await self._ensure_started()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
+
+
+class AsyncFindStream(AsyncIterator[FindEntry]):
+    """A lazy, context-managed, streaming ``syq find`` or ``syq ls`` result."""
+
+    def __init__(
+        self,
+        client: AsyncClient,
+        argv: list[Argument],
+        timeout: float | None,
+        *,
+        command: str = "find",
+    ) -> None:
+        self._client = client
+        self._argv = argv
+        self._timeout = timeout
+        self._command = command
+        self._process: _AsyncLineProcess | None = None
+        self._start_lock = asyncio.Lock()
+        self._complete = False
+
+    async def _ensure_started(self) -> _AsyncLineProcess:
+        async with self._start_lock:
+            if self._process is None:
+                self._process = await self._client._start_line(
+                    self._argv, timeout=self._timeout
+                )
+        return self._process
+
+    def __aiter__(self) -> AsyncFindStream:
+        if self._complete:
+            raise SyqInvocationError(f"{self._command} stream is closed or exhausted")
+        return self
+
+    async def __anext__(self) -> FindEntry:
+        if self._complete:
+            raise StopAsyncIteration
+        process = await self._ensure_started()
+        try:
+            return await _next_async_stream_entry(
+                process, self._command, parse_find_line
+            )
+        except BaseException:
+            self._complete = True
+            raise
+
+    async def aclose(self) -> None:
+        if self._complete:
+            return
+        if self._process is not None:
+            await self._process.abort()
+        self._complete = True
+
+    async def __aenter__(self) -> AsyncFindStream:
+        if self._complete:
+            raise SyqInvocationError(f"{self._command} stream is closed or exhausted")
         await self._ensure_started()
         return self
 
@@ -1204,4 +1277,175 @@ class AsyncClient:
         return AsyncMapStream(
             producer, argv, effective_cwd, producer.timeout,
             confined=root is not None, follow_src=follow or follow_src, from_=from_, connection=connection,
+        )
+
+    def _find(
+        self,
+        command: str,
+        paths: tuple[PathArgument, ...],
+        *,
+        on: str | None,
+        cwd: PathArgument | None,
+        root: PathArgument | None,
+        follow: bool,
+        follow_src: bool,
+        depth: int | None,
+        ignore: IgnoreSelector | None,
+        ignore_from: Selector | None,
+        where: str | None,
+        include: Iterable[str] | None,
+        performance_tuning: str | None,
+        rsh: str | None,
+        syq_path: str | os.PathLike[str] | None,
+        no_bootstrap: bool,
+        auth_from: str | None,
+        pscope: PathArgument | None,
+        s3_endpoint: str | None,
+        s3_region: str | None,
+        s3_profile: str | None,
+        s3_header: Iterable[str] | None,
+        s3_retries: int | None,
+        timeout: Timeout,
+    ) -> AsyncFindStream:
+        environment = dict(os.environ if self.env is None else self.env)
+        producer = AsyncClient(
+            executable=self._executable,
+            cache_dir=self._cache_dir,
+            process_cwd=_map_stream_cwd(self.process_cwd, environment, None, None),
+            env=environment,
+            timeout=resolve_timeout(timeout, self.timeout),
+        )
+        argv = _find_arguments(
+            command,
+            paths,
+            on=on,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            depth=depth,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            where=where,
+            include=include,
+            performance_tuning=performance_tuning,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            auth_from=auth_from,
+            pscope=pscope,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_retries=s3_retries,
+        )
+        return AsyncFindStream(
+            producer, argv, producer.timeout, command=command
+        )
+
+    def find(
+        self,
+        *paths: PathArgument,
+        on: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
+        follow: bool = False,
+        follow_src: bool = False,
+        depth: int | None = None,
+        ignore: IgnoreSelector | None = None,
+        ignore_from: Selector | None = None,
+        where: str | None = None,
+        include: Iterable[str] | None = None,
+        performance_tuning: str | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
+    ) -> AsyncFindStream:
+        return self._find(
+            "find",
+            paths,
+            on=on,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            depth=depth,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            where=where,
+            include=include,
+            performance_tuning=performance_tuning,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            auth_from=auth_from,
+            pscope=pscope,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_retries=s3_retries,
+            timeout=timeout,
+        )
+
+    def ls(
+        self,
+        *paths: PathArgument,
+        on: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
+        follow: bool = False,
+        follow_src: bool = False,
+        depth: int | None = None,
+        ignore: IgnoreSelector | None = None,
+        ignore_from: Selector | None = None,
+        where: str | None = None,
+        include: Iterable[str] | None = None,
+        performance_tuning: str | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
+    ) -> AsyncFindStream:
+        return self._find(
+            "ls",
+            paths,
+            on=on,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            depth=depth,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            where=where,
+            include=include,
+            performance_tuning=performance_tuning,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            auth_from=auth_from,
+            pscope=pscope,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_retries=s3_retries,
+            timeout=timeout,
         )
