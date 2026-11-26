@@ -6,7 +6,8 @@
 //! Sustained throughput collapse can end a probe early.
 //! A fresh start doubles; strong gains restore doubling after a historical
 //! plateau proves obsolete. Failed experiments restore the previous count.
-//! Elapsed time bounds directional backoff (30 s up, 60 s down), independently
+//! Elapsed time bounds directional backoff (upward 30–120 s depending on
+//! transport, 60 s down), independently
 //! of how many measurements stabilize. Upward wins ties; small inconclusive
 //! increases stay active while uncertain reductions restore the higher count.
 //!

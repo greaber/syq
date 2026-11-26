@@ -32,13 +32,6 @@ struct PreparedSystem {
 }
 
 #[derive(Clone, Copy)]
-enum CostModel {
-    Transport(crate::tune::TransportProfile),
-    #[cfg(test)]
-    Flat,
-}
-
-#[derive(Clone, Copy)]
 struct ConcurrencyCost {
     low: f64,
     knee: f64,
@@ -61,22 +54,13 @@ fn concurrency_cost(profile: crate::tune::TransportProfile) -> ConcurrencyCost {
     }
 }
 
-fn above_floor_penalty(nf: f64, floor: f64, cost: CostModel) -> f64 {
-    match cost {
-        CostModel::Transport(profile) => {
-            let cost = concurrency_cost(profile);
-            let knee = cost.knee.max(floor);
-            if nf <= knee {
-                cost.low * (nf / floor).ln()
-            } else {
-                cost.low * (knee / floor).ln() + cost.high * (nf / knee).ln()
-            }
-        }
-        #[cfg(test)]
-        CostModel::Flat => {
-            const FLAT_CONCURRENCY_COST: f64 = 0.08;
-            FLAT_CONCURRENCY_COST * (nf / floor).ln()
-        }
+fn above_floor_penalty(nf: f64, floor: f64, profile: crate::tune::TransportProfile) -> f64 {
+    let cost = concurrency_cost(profile);
+    let knee = cost.knee.max(floor);
+    if nf <= knee {
+        cost.low * (nf / floor).ln()
+    } else {
+        cost.low * (knee / floor).ln() + cost.high * (nf / knee).ln()
     }
 }
 
@@ -123,7 +107,12 @@ impl PooledInference {
         })
     }
 
-    fn solve(self, specific: bool, default_start: usize, cost: CostModel) -> Option<Hint> {
+    fn solve(
+        self,
+        specific: bool,
+        default_start: usize,
+        profile: crate::tune::TransportProfile,
+    ) -> Option<Hint> {
         const FLOOR_MARGIN: f64 = 0.03;
         let PreparedSystem {
             verts,
@@ -141,7 +130,7 @@ impl PooledInference {
         for (k, &n) in verts.iter().enumerate() {
             let nf = n as f64;
             let penalty = if nf >= floor {
-                above_floor_penalty(nf, floor, cost)
+                above_floor_penalty(nf, floor, profile)
             } else {
                 crate::tune::NEAR_BEST_TOLERANCE + FLOOR_MARGIN * (floor / nf).ln()
             };
@@ -343,32 +332,6 @@ pub(super) fn starting_count(
     default_start: usize,
     profile: crate::tune::TransportProfile,
 ) -> Result<Option<Hint>> {
-    starting_count_with(
-        db,
-        key,
-        allow_route,
-        default_start,
-        CostModel::Transport(profile),
-    )
-}
-
-#[cfg(test)]
-pub(super) fn starting_count_flat(
-    db: &Connection,
-    key: &ContextKey,
-    allow_route: bool,
-    default_start: usize,
-) -> Result<Option<Hint>> {
-    starting_count_with(db, key, allow_route, default_start, CostModel::Flat)
-}
-
-fn starting_count_with(
-    db: &Connection,
-    key: &ContextKey,
-    allow_route: bool,
-    default_start: usize,
-    cost: CostModel,
-) -> Result<Option<Hint>> {
     let exact = key.source_filesystem.is_some() && key.destination_filesystem.is_some();
     for specific in [true, false] {
         if (specific && !exact) || (!specific && !allow_route) {
@@ -431,7 +394,7 @@ fn starting_count_with(
                 }
             }
         }
-        if let Some(hint) = pooled.solve(specific, default_start, cost) {
+        if let Some(hint) = pooled.solve(specific, default_start, profile) {
             return Ok(Some(hint));
         }
     }
@@ -639,11 +602,7 @@ fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
     let mut pooled = PooledInference::default();
     pooled.push_run(1, 1.0, evidence);
     pooled
-        .solve(
-            true,
-            1,
-            CostModel::Transport(crate::tune::TransportProfile::Ssh),
-        )
+        .solve(true, 1, crate::tune::TransportProfile::Ssh)
         .map(|h| (h.workers, h.refine))
 }
 
@@ -1531,7 +1490,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         assert!(max_diff < 1e-6, "max_diff={max_diff}");
-        let ssh = CostModel::Transport(crate::tune::TransportProfile::Ssh);
+        let ssh = crate::tune::TransportProfile::Ssh;
         assert_eq!(pool_128.solve(true, 1, ssh).unwrap().workers, 255);
         assert_eq!(build_pool(256).solve(true, 1, ssh).unwrap().workers, 256);
         assert_eq!(build_pool(383).solve(true, 1, ssh).unwrap().workers, 383);
@@ -1622,22 +1581,12 @@ mod tests {
 
         // Continuity at the knee and floor >= knee behavior.
         let ssh_cost = concurrency_cost(TransportProfile::Ssh);
-        let p_left = above_floor_penalty(
-            32.0 - 1e-6,
-            8.0,
-            CostModel::Transport(TransportProfile::Ssh),
-        );
-        let p_right = above_floor_penalty(
-            32.0 + 1e-6,
-            8.0,
-            CostModel::Transport(TransportProfile::Ssh),
-        );
+        let p_left = above_floor_penalty(32.0 - 1e-6, 8.0, TransportProfile::Ssh);
+        let p_right = above_floor_penalty(32.0 + 1e-6, 8.0, TransportProfile::Ssh);
         assert!((p_right - p_left).abs() < 1e-5, "{p_left} vs {p_right}");
         assert!((ssh_cost.knee - 32.0).abs() < 1e-9);
         assert!(
-            (above_floor_penalty(128.0, 64.0, CostModel::Transport(TransportProfile::Ssh))
-                - 0.10 * 2.0_f64.ln())
-            .abs()
+            (above_floor_penalty(128.0, 64.0, TransportProfile::Ssh) - 0.10 * 2.0_f64.ln()).abs()
                 < 1e-12
         );
     }

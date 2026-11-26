@@ -471,23 +471,6 @@ impl Recorder {
             .flatten()
     }
 
-    #[cfg(test)]
-    pub(in crate::tune) fn starting_count_flat(
-        &self,
-        key: &ContextKey,
-        allow_route: bool,
-        default_start: usize,
-    ) -> Option<Hint> {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.ready() {
-            return None;
-        }
-        let db = &state.store.opened()?.db;
-        inference::starting_count_flat(db, key, allow_route, default_start)
-            .ok()
-            .flatten()
-    }
-
     /// Record the outcome and the final summary. Later events are ignored.
     pub(crate) fn complete(&self, success: bool, summary: Value) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
