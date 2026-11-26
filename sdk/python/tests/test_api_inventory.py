@@ -27,6 +27,8 @@ class NativeApiInventoryTests(unittest.TestCase):
             "cp": {"self", "sources", "on_event", "timeout", "check", "stream_concurrency", "inplace"},
             "rm": {"self", "sources", "on_event", "timeout", "check"},
             "map": {"self", "sources", "timeout"},
+            "find": {"self", "paths", "timeout"},
+            "ls": {"self", "paths", "timeout"},
         }
         for command, classified in self.inventory["commands"].items():
             if classified["sdk"] != "python":
@@ -71,7 +73,7 @@ class NativeApiInventoryTests(unittest.TestCase):
 
         sync = public_methods(syq.Client)
         async_ = public_methods(syq.AsyncClient)
-        self.assertEqual(set(sync), {"cp", "rm", "map", "run", "version", "open_reader", "open_writer"})
+        self.assertEqual(set(sync), {"cp", "rm", "map", "find", "ls", "run", "version", "open_reader", "open_writer"})
         self.assertEqual(set(async_), set(sync))
         for name in sync:
             with self.subTest(method=name):

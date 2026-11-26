@@ -196,12 +196,8 @@
       "follow_up": []
     },
     "find": {
-      "sdk": "follow_up",
-      "python": [],
-      "internal": [],
-      "aliases": {},
-      "raw_only": [],
-      "follow_up": [
+      "sdk": "python",
+      "python": [
         "on",
         "cwd",
         "root",
@@ -211,9 +207,6 @@
         "ignore",
         "ignore-from",
         "where",
-        "long",
-        "json",
-        "null",
         "include",
         "performance-tuning",
         "rsh",
@@ -226,15 +219,20 @@
         "s3-profile",
         "s3-header",
         "s3-retries"
-      ]
+      ],
+      "internal": [
+        "json"
+      ],
+      "aliases": {},
+      "raw_only": [
+        "long",
+        "null"
+      ],
+      "follow_up": []
     },
     "ls": {
-      "sdk": "follow_up",
-      "python": [],
-      "internal": [],
-      "aliases": {},
-      "raw_only": [],
-      "follow_up": [
+      "sdk": "python",
+      "python": [
         "on",
         "cwd",
         "root",
@@ -244,9 +242,6 @@
         "ignore",
         "ignore-from",
         "where",
-        "long",
-        "json",
-        "null",
         "include",
         "performance-tuning",
         "rsh",
@@ -259,7 +254,16 @@
         "s3-profile",
         "s3-header",
         "s3-retries"
-      ]
+      ],
+      "internal": [
+        "json"
+      ],
+      "aliases": {},
+      "raw_only": [
+        "long",
+        "null"
+      ],
+      "follow_up": []
     }
   }
 }

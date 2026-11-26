@@ -6,9 +6,9 @@ from ._stream_endpoints import StreamSource, StreamDestination
 from ._streams import StreamReader, StreamWriter, AsyncStreamReader, AsyncStreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout
 from ._mapping import Mapping, AsyncMapping
-from .async_client import AsyncClient, AsyncMapStream
+from .async_client import AsyncClient, AsyncFindStream, AsyncMapStream
 from .managed import PINNED_SYQ_VERSION, SyqInstallError, managed_executable
-from .client import Client, MapStream, Result, run, version
+from .client import Client, FindStream, MapStream, Result, run, version
 from .errors import (
     SyqError,
     SyqInvocationError,
@@ -30,6 +30,7 @@ from .models import (
     EntryKind,
     ErrorClass,
     ErrorEvent,
+    FindEntry,
     IgnoreFrom,
     MappingEntry,
     MappingStreamResult,
@@ -58,6 +59,8 @@ _default_client = Client()
 cp = _default_client.cp
 rm = _default_client.rm
 map = _default_client.map
+find = _default_client.find
+ls = _default_client.ls
 open_reader = _default_client.open_reader
 open_writer = _default_client.open_writer
 
@@ -69,6 +72,7 @@ __all__ = [
     "Timeout",
     "PINNED_SYQ_VERSION",
     "AsyncClient",
+    "AsyncFindStream",
     "AsyncMapStream",
     "AutomationEvent",
     "ProtocolMetadata",
@@ -76,6 +80,8 @@ __all__ = [
     "Client",
     "CpResult",
     "Disposition",
+    "FindEntry",
+    "FindStream",
     "Hash",
     "HashAlgorithm",
     "Endpoint",
@@ -117,6 +123,8 @@ __all__ = [
     "TraceEvent",
     "TraceReason",
     "cp",
+    "find",
+    "ls",
     "managed_executable",
     "map",
     "rm",

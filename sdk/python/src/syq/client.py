@@ -12,10 +12,10 @@ import tempfile
 import threading
 import time
 import warnings
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TypeVar
 
 from ._streams import StreamReader, StreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
@@ -35,6 +35,7 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    FindEntry,
     IgnoreFrom,
     MappingEntry,
     OperationStatus,
@@ -42,7 +43,7 @@ from .models import (
     RmResult,
     _mapping_json,
 )
-from .protocol import AutomationDecoder, parse_mapping_line
+from .protocol import AutomationDecoder, parse_find_line, parse_mapping_line
 from ._stream_endpoints import StreamSource, StreamDestination
 from ._callback_runtime import Callbacks
 
@@ -50,6 +51,19 @@ from ._callback_runtime import Callbacks
 Argument = str | bytes
 Selector = PathArgument | Iterable[PathArgument]
 IgnoreSelector = str | IgnoreFrom | Iterable[str | IgnoreFrom]
+_T = TypeVar("_T")
+_FIND_INCLUDE_FIELDS = frozenset({
+    "kind",
+    "size",
+    "mtime",
+    "s3_last_modified",
+    "etag",
+    "mode",
+    "uid",
+    "gid",
+    "ctime",
+    "link_target",
+})
 _MAX_STREAM_LINE_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
 _REAP_WAIT_TIMEOUT = 0.5
@@ -70,6 +84,13 @@ def _text_arg(value: str | os.PathLike[str], *, label: str) -> str:
     if not isinstance(result, str):
         raise TypeError(f"{label} must resolve to text, not bytes")
     return result
+
+
+def _text_value(value: str | os.PathLike[str], *, label: str) -> str:
+    text = _text_arg(value, label=label)
+    if "\0" in text:
+        raise ValueError(f"{label} may not contain NUL")
+    return text
 
 
 def _argument(value: PathArgument, *, label: str) -> Argument:
@@ -639,6 +660,30 @@ def _warn_unsupported_copy_options(*, only_existing=False,
         )
 
 
+def _append_ignore_arguments(
+    argv: list[Argument],
+    *,
+    ignore: IgnoreSelector | None,
+    ignore_from: Selector | None,
+) -> None:
+    if ignore is not None:
+        rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
+        for rule in rules:
+            if isinstance(rule, IgnoreFrom):
+                _append_path_option(
+                    argv,
+                    "--ignore-from",
+                    _argument(rule.path, label="--ignore-from"),
+                )
+            elif isinstance(rule, str):
+                _append_path_option(argv, "--ignore", _argument(rule, label="--ignore"))
+            else:
+                raise SyqInvocationError(
+                    "--ignore entries must be text or syq.IgnoreFrom"
+                )
+    _append_paths(argv, "--ignore-from", ignore_from)
+
+
 def _copy_arguments(
     command: str,
     sources: tuple[PathArgument, ...],
@@ -788,22 +833,7 @@ def _copy_arguments(
         argv.extend(("--receiver-max-entries", str(receiver_max_entries)))
     _append_text(argv, "--receiver-max-bytes", receiver_max_bytes)
     ignore_start = len(argv)
-    if ignore is not None:
-        rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
-        for rule in rules:
-            if isinstance(rule, IgnoreFrom):
-                _append_path_option(
-                    argv,
-                    "--ignore-from",
-                    _argument(rule.path, label="--ignore-from"),
-                )
-            elif isinstance(rule, str):
-                _append_path_option(argv, "--ignore", rule)
-            else:
-                raise SyqInvocationError(
-                    "--ignore entries must be text or syq.IgnoreFrom"
-                )
-    _append_paths(argv, "--ignore-from", ignore_from)
+    _append_ignore_arguments(argv, ignore=ignore, ignore_from=ignore_from)
     if mapping and len(argv) != ignore_start:
         raise SyqInvocationError(
             "--mapping cannot be combined with --ignore or --ignore-from; "
@@ -937,6 +967,169 @@ def _rm_arguments(
     return argv, source_count
 
 
+def _find_arguments(
+    command: str,
+    paths: tuple[PathArgument, ...],
+    *,
+    on: str | None,
+    cwd: PathArgument | None,
+    root: PathArgument | None,
+    follow: bool,
+    follow_src: bool,
+    depth: int | None,
+    ignore: IgnoreSelector | None,
+    ignore_from: Selector | None,
+    where: str | None,
+    include: Iterable[str] | None,
+    performance_tuning: str | None,
+    rsh: str | None,
+    syq_path: str | os.PathLike[str] | None,
+    no_bootstrap: bool,
+    auth_from: str | None,
+    pscope: PathArgument | None,
+    s3_endpoint: str | None,
+    s3_region: str | None,
+    s3_profile: str | None,
+    s3_header: Iterable[str] | None,
+    s3_retries: int | None,
+) -> list[Argument]:
+    argv: list[Argument] = [command, "--json"]
+    on_text: str | None = None
+    if on is not None:
+        on_text = _text_value(on, label="on")
+        if not on_text:
+            raise SyqInvocationError("on may not be empty")
+        _append_path_option(argv, "--on", on_text)
+    is_s3 = on_text is not None and on_text.startswith("s3://")
+    is_ssh = on_text is not None and not is_s3
+    if cwd is not None and root is not None:
+        raise SyqInvocationError("cwd and root are mutually exclusive")
+    if cwd is not None:
+        _append_path_option(argv, "--cwd", _argument(cwd, label="cwd"))
+    if root is not None:
+        _append_path_option(argv, "--root", _argument(root, label="root"))
+    for name, flag in (
+        ("follow", follow),
+        ("follow_src", follow_src),
+        ("no_bootstrap", no_bootstrap),
+    ):
+        if not isinstance(flag, bool):
+            raise SyqInvocationError(f"{name} must be a boolean")
+    if is_s3 and (follow or follow_src):
+        raise SyqInvocationError("follow and follow_src require a filesystem endpoint")
+    if follow:
+        argv.append("--follow")
+    if follow_src:
+        argv.append("--follow-src")
+    depth = _positive_integer(depth, option="--depth")
+    if depth is not None:
+        argv.extend(("--depth", str(depth)))
+    _append_ignore_arguments(argv, ignore=ignore, ignore_from=ignore_from)
+    if where is not None:
+        if not isinstance(where, str):
+            raise SyqInvocationError("--where must be a string")
+        if "\0" in where:
+            raise ValueError("where may not contain NUL")
+        _append_path_option(argv, "--where", where)
+    if include is not None:
+        if isinstance(include, (str, bytes)):
+            raise SyqInvocationError("include must be an iterable of field names")
+        fields = tuple(include)
+        if not fields:
+            raise SyqInvocationError("include must contain at least one field name")
+        for field in fields:
+            if not isinstance(field, str) or field not in _FIND_INCLUDE_FIELDS:
+                raise SyqInvocationError(f"unknown find field: {field!r}")
+            if not is_s3 and field in {"s3_last_modified", "etag"}:
+                raise SyqInvocationError(
+                    f"include field {field!r} requires an S3 endpoint (on='s3://BUCKET')"
+                )
+            if is_s3 and field in {"ctime", "link_target"}:
+                raise SyqInvocationError(
+                    f"include field {field!r} requires a filesystem endpoint"
+                )
+            argv.append("--include=" + field)
+    if performance_tuning is not None:
+        if not is_s3:
+            raise SyqInvocationError(
+                "performance_tuning applies only to S3 listings (on='s3://BUCKET')"
+            )
+        if not isinstance(performance_tuning, str):
+            raise SyqInvocationError("--performance-tuning must be a string")
+        if "\0" in performance_tuning:
+            raise ValueError("performance_tuning may not contain NUL")
+        _append_path_option(argv, "--performance-tuning", performance_tuning)
+    if not is_ssh and (
+        auth_from is not None
+        or rsh is not None
+        or syq_path is not None
+        or no_bootstrap
+        or pscope is not None
+    ):
+        raise SyqInvocationError(
+            "auth_from, rsh, syq_path, no_bootstrap, and pscope require an SSH endpoint"
+        )
+    if syq_path is not None and no_bootstrap:
+        raise SyqInvocationError("syq_path and no_bootstrap conflict")
+    if rsh is not None:
+        _append_path_option(argv, "--rsh", _text_value(rsh, label="rsh"))
+    if syq_path is not None:
+        _append_path_option(
+            argv, "--syq-path", _text_value(syq_path, label="syq_path")
+        )
+    if no_bootstrap:
+        argv.append("--no-bootstrap")
+    if auth_from is not None:
+        _append_path_option(
+            argv, "--auth-from", _text_value(auth_from, label="auth_from")
+        )
+    if pscope is not None:
+        _append_path_option(
+            argv, "--pscope", _argument(pscope, label="pscope")
+        )
+    if not is_s3 and any(
+        value is not None
+        for value in (s3_endpoint, s3_region, s3_profile, s3_header, s3_retries)
+    ):
+        raise SyqInvocationError("S3 listing options require on='s3://BUCKET'")
+    _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header, s3_retries)
+    path_values = tuple(
+        _argument(path, label=f"paths[{index}]")
+        for index, path in enumerate(paths)
+    )
+    if path_values:
+        argv.append("--")
+        argv.extend(path_values)
+    return argv
+
+
+def _next_stream_entry(
+    process: _LineProcess,
+    command: str,
+    parse: Callable[[bytes], _T],
+) -> _T:
+    try:
+        line = process.next_line()
+        if line is None:
+            returncode = process.finish()
+            if returncode != 0:
+                raise SyqProtocolError(
+                    f"syq {command} exited with status {returncode}",
+                    returncode=returncode,
+                    stderr=process.stderr,
+                )
+            raise StopIteration
+        return parse(line)
+    except StopIteration:
+        raise
+    except BaseException as error:
+        process.abort()
+        if isinstance(error, SyqProtocolError):
+            error.returncode = process.returncode
+            error.stderr = process.stderr
+        raise
+
+
 def _mapping_line(entry: MappingEntry, *, index: int) -> bytes:
     if not isinstance(entry, MappingEntry):
         raise TypeError(f"mapping[{index}] must be a MappingEntry")
@@ -989,26 +1182,9 @@ class MapStream(FileMapping):
         if self._complete:
             raise StopIteration
         try:
-            line = self._process.next_line()
-            if line is None:
-                returncode = self._process.finish()
-                self._complete = True
-                if returncode != 0:
-                    raise SyqProtocolError(
-                        f"syq map exited with status {returncode}",
-                        returncode=returncode,
-                        stderr=self._process.stderr,
-                    )
-                raise StopIteration
-            return parse_mapping_line(line)
-        except StopIteration:
-            raise
-        except BaseException as error:
-            self._process.abort()
+            return _next_stream_entry(self._process, "map", parse_mapping_line)
+        except BaseException:
             self._complete = True
-            if isinstance(error, SyqProtocolError):
-                error.returncode = self._process.returncode
-                error.stderr = self._process.stderr
             raise
 
     def close(self) -> None:
@@ -1017,6 +1193,48 @@ class MapStream(FileMapping):
             self._complete = True
 
     def __enter__(self) -> MapStream:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class FindStream(Iterator[FindEntry]):
+    """A context-managed, streaming ``syq find`` or ``syq ls`` result."""
+
+    def __init__(self, process: _LineProcess, *, command: str = "find") -> None:
+        self._process = process
+        self._command = command
+        self._complete = False
+
+    def __iter__(self) -> FindStream:
+        if self._complete:
+            raise SyqInvocationError(f"{self._command} stream is closed or exhausted")
+        return self
+
+    def __next__(self) -> FindEntry:
+        if self._complete:
+            raise StopIteration
+        try:
+            return _next_stream_entry(
+                self._process, self._command, parse_find_line
+            )
+        except BaseException:
+            self._complete = True
+            raise
+
+    def close(self) -> None:
+        if not self._complete:
+            self._process.abort()
+            self._complete = True
+
+    def __enter__(self) -> FindStream:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -1657,4 +1875,174 @@ class Client:
             effective_cwd,
             confined=root is not None,
             follow_src=follow or follow_src, from_=from_, connection=connection,
+        )
+
+    def _find(
+        self,
+        command: str,
+        paths: tuple[PathArgument, ...],
+        *,
+        on: str | None,
+        cwd: PathArgument | None,
+        root: PathArgument | None,
+        follow: bool,
+        follow_src: bool,
+        depth: int | None,
+        ignore: IgnoreSelector | None,
+        ignore_from: Selector | None,
+        where: str | None,
+        include: Iterable[str] | None,
+        performance_tuning: str | None,
+        rsh: str | None,
+        syq_path: str | os.PathLike[str] | None,
+        no_bootstrap: bool,
+        auth_from: str | None,
+        pscope: PathArgument | None,
+        s3_endpoint: str | None,
+        s3_region: str | None,
+        s3_profile: str | None,
+        s3_header: Iterable[str] | None,
+        s3_retries: int | None,
+        timeout: Timeout,
+    ) -> FindStream:
+        argv = _find_arguments(
+            command,
+            paths,
+            on=on,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            depth=depth,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            where=where,
+            include=include,
+            performance_tuning=performance_tuning,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            auth_from=auth_from,
+            pscope=pscope,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_retries=s3_retries,
+        )
+        line_command = (self._executable_value(), *argv)
+        return FindStream(
+            _LineProcess(
+                line_command,
+                cwd=self.process_cwd,
+                env=self.env,
+                timeout=resolve_timeout(timeout, self.timeout),
+            ),
+            command=command,
+        )
+
+    def find(
+        self,
+        *paths: PathArgument,
+        on: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
+        follow: bool = False,
+        follow_src: bool = False,
+        depth: int | None = None,
+        ignore: IgnoreSelector | None = None,
+        ignore_from: Selector | None = None,
+        where: str | None = None,
+        include: Iterable[str] | None = None,
+        performance_tuning: str | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
+    ) -> FindStream:
+        return self._find(
+            "find",
+            paths,
+            on=on,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            depth=depth,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            where=where,
+            include=include,
+            performance_tuning=performance_tuning,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            auth_from=auth_from,
+            pscope=pscope,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_retries=s3_retries,
+            timeout=timeout,
+        )
+
+    def ls(
+        self,
+        *paths: PathArgument,
+        on: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
+        follow: bool = False,
+        follow_src: bool = False,
+        depth: int | None = None,
+        ignore: IgnoreSelector | None = None,
+        ignore_from: Selector | None = None,
+        where: str | None = None,
+        include: Iterable[str] | None = None,
+        performance_tuning: str | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
+    ) -> FindStream:
+        return self._find(
+            "ls",
+            paths,
+            on=on,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            depth=depth,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            where=where,
+            include=include,
+            performance_tuning=performance_tuning,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            auth_from=auth_from,
+            pscope=pscope,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_retries=s3_retries,
+            timeout=timeout,
         )

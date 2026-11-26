@@ -19,6 +19,7 @@ from .models import (
     EntryKind,
     ErrorClass,
     ErrorEvent,
+    FindEntry,
     Hash,
     MappingEntry,
     MappingStreamResult,
@@ -48,6 +49,30 @@ SCHEMA = "syq.automation"
 SCHEMA_VERSION = 4
 _MAX_U64 = (1 << 64) - 1
 _MAX_I64 = (1 << 63) - 1
+_MAX_U32 = (1 << 32) - 1
+_FIND_FIELDS = frozenset({
+    "path",
+    "kind",
+    "size",
+    "mtime",
+    "s3_last_modified",
+    "etag",
+    "mode",
+    "uid",
+    "gid",
+    "ctime",
+    "link_target",
+})
+_FIND_KINDS = frozenset({
+    "file",
+    "dir",
+    "symlink",
+    "fifo",
+    "socket",
+    "char",
+    "block",
+    "other",
+})
 _EnumT = TypeVar("_EnumT")
 
 
@@ -61,35 +86,43 @@ def _object(line: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _string(record: dict[str, Any], key: str) -> str:
+def _string(record: dict[str, Any], key: str, *, prefix: str = "automation field") -> str:
     value = record.get(key)
     if not isinstance(value, str):
-        raise SyqProtocolError(f"automation field {key!r} must be a string")
+        raise SyqProtocolError(f"{prefix} {key!r} must be a string")
     return value
 
 
-def _integer(record: dict[str, Any], key: str, *, nonnegative: bool = True) -> int:
+def _integer(
+    record: dict[str, Any],
+    key: str,
+    *,
+    nonnegative: bool = True,
+    prefix: str = "automation field",
+) -> int:
     value = record.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
-        raise SyqProtocolError(f"automation field {key!r} must be an integer")
+        raise SyqProtocolError(f"{prefix} {key!r} must be an integer")
     if nonnegative:
         if value < 0:
-            raise SyqProtocolError(f"automation field {key!r} must not be negative")
+            raise SyqProtocolError(f"{prefix} {key!r} must not be negative")
         if value > _MAX_U64:
             raise SyqProtocolError(
-                f"automation field {key!r} exceeds the unsigned 64-bit range"
+                f"{prefix} {key!r} exceeds the unsigned 64-bit range"
             )
     elif not -_MAX_I64 - 1 <= value <= _MAX_I64:
         raise SyqProtocolError(
-            f"automation field {key!r} exceeds the signed 64-bit range"
+            f"{prefix} {key!r} exceeds the signed 64-bit range"
         )
     return value
 
 
-def _optional_integer(record: dict[str, Any], key: str) -> int | None:
+def _optional_integer(
+    record: dict[str, Any], key: str, *, prefix: str = "automation field"
+) -> int | None:
     if key not in record:
         return None
-    return _integer(record, key)
+    return _integer(record, key, prefix=prefix)
 
 
 def _timings(record: dict[str, Any]) -> Timings:
@@ -120,10 +153,12 @@ def _boolean(record: dict[str, Any], key: str) -> bool:
     return value
 
 
-def _optional_string(record: dict[str, Any], key: str) -> str | None:
+def _optional_string(
+    record: dict[str, Any], key: str, *, prefix: str = "automation field"
+) -> str | None:
     if key not in record:
         return None
-    return _string(record, key)
+    return _string(record, key, prefix=prefix)
 
 
 def _enum(record: dict[str, Any], key: str, enum_type: type[_EnumT]) -> _EnumT:
@@ -211,6 +246,83 @@ def parse_mapping_line(line: bytes) -> MappingEntry:
             _integer(record, "s3_last_modified", nonnegative=False) if "s3_last_modified" in record else None)
     except (TypeError, ValueError) as error:
         raise SyqProtocolError(f"mapping path is invalid: {error}") from error
+
+
+def parse_find_line(line: bytes) -> FindEntry:
+    """Decode one JSON object emitted by ``syq find --json`` or ``syq ls --json``."""
+
+    try:
+        record = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise SyqProtocolError("find record is not valid UTF-8 JSON") from error
+    if not isinstance(record, dict):
+        raise SyqProtocolError("find record must be a JSON object")
+    if not (record.keys() <= _FIND_FIELDS):
+        unknown = sorted(set(record) - _FIND_FIELDS)[0]
+        raise SyqProtocolError(
+            f"find record has unknown field {unknown!r}"
+        )
+    path = _string(record, "path", prefix="find field")
+    if not path:
+        raise SyqProtocolError("find field 'path' may not be empty")
+    kind = _optional_string(record, "kind", prefix="find field")
+    if kind is not None and kind not in _FIND_KINDS:
+        raise SyqProtocolError("find field 'kind' is unsupported")
+    size = _optional_integer(record, "size", prefix="find field")
+    mtime = (
+        _integer(record, "mtime", nonnegative=False, prefix="find field")
+        if "mtime" in record
+        else None
+    )
+    s3_last_modified = (
+        _integer(
+            record, "s3_last_modified", nonnegative=False, prefix="find field"
+        )
+        if "s3_last_modified" in record
+        else None
+    )
+    etag = _optional_string(record, "etag", prefix="find field")
+    mode = _optional_integer(record, "mode", prefix="find field")
+    if mode is not None and mode > 0o7777:
+        raise SyqProtocolError("find field 'mode' exceeds 0o7777")
+    uid = _optional_integer(record, "uid", prefix="find field")
+    if uid is not None and uid > _MAX_U32:
+        raise SyqProtocolError(
+            "find field 'uid' exceeds the unsigned 32-bit range"
+        )
+    gid = _optional_integer(record, "gid", prefix="find field")
+    if gid is not None and gid > _MAX_U32:
+        raise SyqProtocolError(
+            "find field 'gid' exceeds the unsigned 32-bit range"
+        )
+    ctime = (
+        _integer(record, "ctime", nonnegative=False, prefix="find field")
+        if "ctime" in record
+        else None
+    )
+    link_target = _optional_string(record, "link_target", prefix="find field")
+    if b"\\u" in line:
+        for value in (path, etag, link_target):
+            if value is not None:
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise SyqProtocolError(
+                        "find record contains unpaired Unicode surrogates"
+                    ) from error
+    return FindEntry(
+        path=path,
+        kind=kind,
+        size=size,
+        mtime=mtime,
+        s3_last_modified=s3_last_modified,
+        etag=etag,
+        mode=mode,
+        uid=uid,
+        gid=gid,
+        ctime=ctime,
+        link_target=link_target,
+    )
 
 
 def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:

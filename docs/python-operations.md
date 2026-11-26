@@ -8,4 +8,6 @@
 
 {{#include ../sdk/python/NATIVE_API.md:removal}}
 
+{{#include ../sdk/python/NATIVE_API.md:listing}}
+
 {{#include ../sdk/python/NATIVE_API.md:execution}}
