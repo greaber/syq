@@ -103,9 +103,9 @@ prefixes that can hold a match, such as `laptop/photos/2026-*/` rather than all
 of `laptop/`, unless an earlier condition could fail (such as arithmetic on a
 field or reading stored object metadata like `mtime`). When `--where` rules out
 directories, a `path` pattern can also skip unmatched subtrees in a recursive
-listing. On S3 directory buckets (`--x-s3` and `--xa-s3`), `syq ls` and
-`--depth` can also show a prefix that holds only an in-progress multipart
-upload.
+listing. On S3 directory buckets whose names end with `--x-s3` or `--xa-s3`,
+`syq ls` and `--depth` can also show a prefix that holds only an in-progress
+multipart upload.
 
 Conditions on `path`, `name`, `extension`, `size`, `s3_last_modified`, a
 directory's `kind`, and whether `kind` is `"dir"` use the listing alone. Other
@@ -130,18 +130,17 @@ also asks AWS where the bucket is, with one HEAD request for the bucket itself.
   ownership, and symlink target with the object. By default
   (`--s3-directory-markers=all`), copies to S3 write a 0-byte `dir/` marker for
   every directory so empty directories and directory permissions and
-  modification times survive downloads. Set `--s3-directory-markers=empty` to
-  write markers only for copied directories with no selected entries beneath
-  them (decided from the selected source tree before `--if-exists` or
-  `--copy-if`), or `none` to write no markers at all—for example, to save
-  requests or avoid 0-byte marker objects in other tools. Directories without a
-  marker lose their permissions and modification times on download; existing
-  destination markers for copied directories are left in place. Downloads restore symlinks
-  and modification times, using the S3 Last-Modified time when an object has
-  no stored time; add `--copy-metadata=permissions,ownership` to restore
-  permissions and ownership too. Changing an existing object's metadata
-  rewrites it; see [Copies between S3 buckets](#copies-between-s3-buckets).
-  Special files are unsupported.
+  modification times survive downloads. With `empty`, markers are written only
+  for copied directories with no selected entries beneath them (decided before
+  `--if-exists` or `--copy-if`); with `none`, no markers are written.
+  Directories without a marker lose their permissions and modification times on
+  download, while existing destination markers for copied directories stay in
+  place. Downloads restore symlinks and modification times, using the S3
+  Last-Modified time when an object has no stored time; add
+  `--copy-metadata=permissions,ownership` to restore permissions and ownership
+  too. Changing an existing object's metadata rewrites it; see
+  [Copies between S3 buckets](#copies-between-s3-buckets). Special files are
+  unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect
   individual objects against concurrent creation, as far as your storage
   service's consistency allows, but not a whole prefix.

@@ -607,17 +607,18 @@ for nothing else when that matters.
 
 Upload approval is not a write-only grant. It includes reading object contents
 and metadata within the covered paths to compare with existing files. When
-updates are allowed, it also permits reading and updating tags on the current
-destination object and copying an object onto itself to update metadata, but
-not changing tags on older versions or copying another destination object as
-the source (bucket-to-bucket copies need a separately approved source).
+updates are allowed, it also permits reading destination tags, updating tags on
+the current destination object, and copying an object onto itself to update
+metadata, but not changing tags on older versions or copying another
+destination object as the source (bucket-to-bucket copies need a separately
+approved source).
 
 A [copy between a server and a bucket](object-storage.md#copy-between-a-server-and-a-bucket)
 started from another machine uses the same signed URLs and limits:
 
 - **Without `--auth-from`**, the machine where you type the command signs with
-  no prompt—typing the command is the approval—and refuses any request outside
-  those limits, which ends the copy.
+  no prompt (typing the command is the approval) and refuses any request
+  outside those limits, which ends the copy.
 - **With `--auth-from @NAME`**, the receiving machine `NAME` approves and signs
   as usual. The machine where you typed the command logs in to the server with
   its own SSH access, holds no storage credentials, and relays only signing
@@ -630,8 +631,8 @@ so syq refuses customer-provided encryption key headers
 bucket; run syq on the server to copy with such a key.
 
 Signed URLs last up to seven days, or until the signing credentials expire if
-that is sooner. Anyone who obtains the URLs—including a compromised server—can
-reuse them within their limits until they expire. Ending the command or
+that is sooner. Anyone who obtains the URLs, including a compromised server,
+can reuse them within their limits until they expire. Ending the command or
 stopping receiving stops further signing, but nothing revokes URLs already
 signed short of revoking the credentials that signed them.
 

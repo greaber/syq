@@ -298,8 +298,8 @@ By default, `include` is `None`: filesystem listings populate `kind`, `size`
 `s3_last_modified`, and `etag` from the listing alone. Pass `include` with
 field names (such as `["kind", "mode", "link_target"]`) to select specific
 fields after `path`. On S3, requesting `kind`, `mtime`, `mode`, `uid`, or `gid`
-via `include`, or filtering on stored metadata in `where`, sends a per-object
-`HEAD` request; see
+via `include`, or a `where` condition on fields the listing lacks, sends a
+per-object `HEAD` request; see
 [List objects](https://greaber.github.io/syq/object-storage.html#list-objects).
 
 Paths must be valid UTF-8 strings, as must symlink targets when `link_target` is

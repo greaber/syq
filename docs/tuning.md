@@ -94,11 +94,9 @@ pruning. Filesystem pruning always tunes its own workers.
 `syq find` and `syq ls` send up to 32 S3 listing requests at a time. Use
 `--performance-tuning s3-requests=N` to change that (1–256; larger values
 count as 256); per-object HEAD requests are not affected. With `s3-requests=1`,
-`syq find` without a depth lists one request at a time without splitting a
-prefix into narrower requests, which avoids failing under bucket policies that
-allow listing only the requested prefix (a listing narrowed by a `path`
-condition still falls back to the full prefix if that narrower request is
-refused before anything prints). Filesystem listings have no tuning keys.
+`syq find` without a depth lists one request at a time without splitting the
+prefix; see [Listing large prefixes](object-storage.md#listing-large-prefixes).
+Filesystem listings have no tuning keys.
 
 ## Remembered connection counts
 
@@ -128,11 +126,12 @@ records can change between versions and are not part of the
 remembered counts. When a server coordinates a copy, the history is on that
 server; S3 copies record none.
 
-Very short copies—such as empty, single-file, or small control-connection
-copies—often leave no record. Copies that run longer save progress periodically
-and appear as `incomplete` until they finish (or if they are interrupted); a
-copy interrupted right away leaves no record. When many copies finish at the
-same time, a copy may skip saving rather than wait on the history file.
+Very short copies, such as empty or single-file copies, often leave no record.
+Copies that run longer save progress periodically and appear as `incomplete`
+until they finish (or if they are interrupted); a copy interrupted right away
+leaves no record. When many copies finish at the same time, a copy may skip its
+final save rather than wait on the history file, leaving no record or one still
+marked `incomplete`.
 
 The history holds opaque endpoint, filesystem, and network-address
 identifiers, the UTC date, copy settings, progress numbers, and tuning
