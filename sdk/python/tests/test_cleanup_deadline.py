@@ -5,11 +5,11 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 
 import syq
+from support import resolved_temporary_directory
 from syq._streams import _Process
 
 
@@ -22,7 +22,7 @@ def current_copy_fixture():
 
 class CleanupDeadlineTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = resolved_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name)
         self.pid = root / 'leader'

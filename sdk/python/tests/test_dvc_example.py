@@ -11,9 +11,9 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
+from support import resolved_temporary_directory
 
 EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
 SCRIPT = Path(__file__).resolve().parents[3] / "examples" / "dvc-syq" / "dvc_syq.py"
@@ -40,7 +40,7 @@ def tree(root: Path) -> dict[str, bytes]:
 @unittest.skipUnless(EXECUTABLE, "the DVC example needs SYQ_CANDIDATE_EXECUTABLE")
 class DvcExample(unittest.TestCase):
     def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
+        temporary = resolved_temporary_directory()
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name)
         self.repo, self.remote, self.second = (self.base / n for n in ("repo", "remote", "second"))

@@ -6,19 +6,19 @@ import io
 import json
 import os
 import subprocess
-import tempfile
 import unittest
 import weakref
 from pathlib import Path
 
 import syq
+from support import resolved_temporary_directory
 
 from test_native import FAKE_NATIVE
 
 
 class ErrorAndTimeoutTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = resolved_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.executable = self.root / "syq"
@@ -106,7 +106,7 @@ class AsyncTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(reference())
 
     async def test_timeout_overrides_for_all_async_operations(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             executable = Path(directory) / "syq"
             executable.write_text(FAKE_NATIVE)
             executable.chmod(0o755)
@@ -143,7 +143,7 @@ EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
 @unittest.skipUnless(EXECUTABLE, "candidate binary required")
 class MappingContextTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = resolved_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
         # macOS TMPDIR passes through /var, a symlink to /private/var.
         # These fixtures test mappings, so give the native walker a real path.
@@ -248,7 +248,7 @@ class MappingContextTests(unittest.TestCase):
 @unittest.skipUnless(EXECUTABLE, "candidate binary required")
 class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_transform_and_sync_mapping_cross_client(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "source").mkdir()
             (root / "source/a").write_bytes(b"data")
@@ -271,7 +271,7 @@ class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((root / "other/sync-input/a").read_bytes(), b"data")
 
     async def test_lazy_map_snapshots_producer_directory_and_environment(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             for name in ("first", "second"):
                 (root / name).mkdir()
@@ -291,7 +291,7 @@ class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((root / "home/a").read_text(), "first")
 
     async def test_async_mapping_constructor_and_closed_stream(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "source").mkdir()
             (root / "source/a").write_bytes(b"data")
@@ -308,7 +308,7 @@ class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((root / "closed").exists())
 
     async def test_async_failed_or_cancelled_transform_leaves_destination_untouched(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "a").write_bytes(b"data")
             client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)

@@ -6,12 +6,12 @@ from dataclasses import replace
 import http.server
 import os
 from pathlib import Path
-import tempfile
 import threading
 import unittest
 import urllib.parse
 
 import syq
+from support import resolved_temporary_directory
 
 
 class ObjectServer:
@@ -74,7 +74,7 @@ class RemoteMappingTests(unittest.TestCase):
     def test_source_endpoint_and_header_survive_sync_and_async_copy(self):
         for asynchronous in (False, True):
             with self.subTest(asynchronous=asynchronous), ExitStack() as stack:
-                directory = stack.enter_context(tempfile.TemporaryDirectory())
+                directory = stack.enter_context(resolved_temporary_directory())
                 root = Path(directory).resolve()
                 source = stack.enter_context(ObjectServer(b"source A"))
                 other = stack.enter_context(ObjectServer(b"source B"))
@@ -114,7 +114,7 @@ class RemoteMappingTests(unittest.TestCase):
                 self.assertTrue(all(header == "A" for _, _, header in source.requests))
 
     def test_s3_path_entries_share_a_manifest_with_callback_entries(self):
-        with tempfile.TemporaryDirectory() as directory, ObjectServer(b"source bytes") as source:
+        with resolved_temporary_directory() as directory, ObjectServer(b"source bytes") as source:
             root = Path(directory).resolve()
             env = os.environ | {
                 "AWS_ACCESS_KEY_ID": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture",
@@ -204,7 +204,7 @@ class RemoteMappingTests(unittest.TestCase):
         def write_stream(out):
             out.write(b"callback payload")
 
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "dir_with_cb").mkdir()
             (root / "truly_empty").mkdir()

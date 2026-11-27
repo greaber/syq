@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import unittest
 from pathlib import Path
 
 import syq
+from support import resolved_temporary_directory
 from syq.models import _mapping_json
 from syq.protocol import AutomationDecoder, parse_mapping_line
 
@@ -49,7 +49,7 @@ class MetadataTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("SYQ_CANDIDATE_EXECUTABLE"), "candidate binary required")
     def test_copy_sets_destination_without_changing_source(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "src").mkdir()
             (root / "src/source").write_bytes(b"payload")

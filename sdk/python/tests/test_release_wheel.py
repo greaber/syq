@@ -8,9 +8,9 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 import zipfile
+from support import resolved_temporary_directory
 
 # The release scripts run on the interpreter pinned by scripts/setup.sh and
 # use tomllib, which the oldest Python the package supports does not have.
@@ -25,7 +25,7 @@ spec.loader.exec_module(wheels)
 
 class ReleaseWheelTests(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory()
+        temp = resolved_temporary_directory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.project = self.root / "project"

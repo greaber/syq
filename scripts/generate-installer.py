@@ -94,21 +94,39 @@ else
 fi
 fetch() {
   if [ "$downloader" = curl ]; then
-    curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 \
+    curl --fail --silent --show-error --location --retry 0 --connect-timeout 10 \
+      --speed-time 30 --speed-limit 1024 \
       --proto '=https' --proto-redir '=https' --output - "$1"
   else
-    wget --quiet --https-only --timeout=10 --tries=3 -O - "$1"
+    wget --quiet --https-only --timeout=10 --tries=1 -O - "$1"
   fi
 }
 
 # Keep at most one byte more than the archive, so that a larger download stops
-# early instead of filling the disk.
-fetch "$base_url/$archive" | head -c "$((expected_size + 1))" > "$download"
-actual_size=$(wc -c < "$download" | tr -d '[:space:]')
-[ "$actual_size" -le "$expected_size" ] || {
-  echo "install.sh: downloaded archive is larger than the expected $expected_size bytes" >&2
-  exit 1
-}
+# early instead of filling the disk. Retry outside curl/wget so a retry after a
+# mid-transfer stall starts a fresh file instead of appending to partial stdout.
+attempt=1
+fetch_failed="$work/fetch-failed"
+while :; do
+  rm -f "$fetch_failed"
+  {
+    fetch "$base_url/$archive" || : > "$fetch_failed"
+  } | head -c "$((expected_size + 1))" > "$download"
+  actual_size=$(wc -c < "$download" | tr -d '[:space:]')
+  [ "$actual_size" -le "$expected_size" ] || {
+    echo "install.sh: downloaded archive is larger than the expected $expected_size bytes" >&2
+    exit 1
+  }
+  if [ ! -e "$fetch_failed" ]; then
+    break
+  fi
+  if [ "$attempt" -ge 3 ]; then
+    echo 'install.sh: download failed' >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
 [ "$actual_size" = "$expected_size" ] || {
   echo "install.sh: downloaded archive has size $actual_size, expected $expected_size" >&2
   exit 1

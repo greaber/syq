@@ -163,7 +163,7 @@ jobs:
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
           tests/tooling/test-python-sdk-release-tools.py
-          uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
+          uv sync --project sdk/python --frozen --no-install-project
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
@@ -171,7 +171,7 @@ jobs:
           output=target/sdk-python-dist
           # Restored Cargo caches can contain distributions from an older SDK.
           rm -rf -- "$output"
-          MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
+          MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --no-sync python -m build sdk/python --sdist --wheel --outdir "$output"
           python scripts/normalize-python-sdist.py \
             --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
           set -- target/sdk-python-dist/syq-*-py3-none-*.whl
@@ -179,14 +179,16 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
-          # Run the tests against the wheel on the oldest Python it supports.
+          # Run the tests against the built wheel on the pinned Python and the oldest Python it supports.
           floor=$(sed -n 's/^requires-python = ">=\(.*\)"/\1/p' sdk/python/pyproject.toml)
           test -n "$floor"
           uv export --project sdk/python --frozen --only-dev --no-emit-project \
             --quiet --output-file target/sdk-python-dev-requirements.txt
-          env -u PYTHONPATH uv run --isolated --python "$floor" \
-            --with "$1" --with-requirements target/sdk-python-dev-requirements.txt \
-            python -m unittest discover -s sdk/python/tests
+          for py in "$UV_PYTHON" "$floor"; do
+            env -u PYTHONPATH uv run --isolated --python "$py" \
+              --with "$1" --with-requirements target/sdk-python-dev-requirements.txt \
+              python -m unittest discover -s sdk/python/tests
+          done
           rm -rf -- target/sdk-python-from-sdist
           # Archive mtimes can repeat across commits. Rebuild syq itself while
           # keeping dependencies outside the disposable extraction directory.

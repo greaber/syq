@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import syq
+from support import resolved_temporary_directory
 
 try:
     from test_native import FAKE_NATIVE, full_nonblocking_pipe
@@ -31,7 +32,7 @@ sys.stdout.buffer.write(data.upper())
 
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = resolved_temporary_directory()
         self.root = Path(self.temporary_directory.name)
         self.executable = self.root / "syq"
         self.executable.write_text(FAKE_NATIVE, encoding="utf-8")

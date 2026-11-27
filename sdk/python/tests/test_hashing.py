@@ -4,12 +4,12 @@ import dataclasses
 import hashlib
 import json
 import os
-import tempfile
 import unittest
 import warnings
 from pathlib import Path
 
 import syq
+from support import resolved_temporary_directory
 from syq.models import _mapping_json
 from syq.protocol import AutomationDecoder, parse_mapping_line
 from test_native import FAKE_NATIVE
@@ -94,7 +94,7 @@ class HashTests(unittest.TestCase):
 
 class HashArgumentsTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = resolved_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name)
         self.executable = root / "syq"
@@ -134,7 +134,7 @@ class HashArgumentsTests(unittest.TestCase):
 
 class AsyncHashArgumentsTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_uses_identical_hash_options(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             executable = root / "syq"
             executable.write_text(FAKE_NATIVE)
@@ -150,7 +150,7 @@ class AsyncHashArgumentsTests(unittest.IsolatedAsyncioTestCase):
 @unittest.skipUnless(os.environ.get("SYQ_CANDIDATE_EXECUTABLE"), "candidate binary required")
 class CandidateHashingTests(unittest.TestCase):
     def test_expected_hash_verifies_copy_and_metadata_match_then_reports_mismatch(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "src").mkdir()
             (root / "src/source").write_bytes(b"abc")
@@ -176,7 +176,7 @@ class CandidateHashingTests(unittest.TestCase):
             self.assertEqual(failed[0].expected_hash, syq.Hash("md5", "0" * 32))
 
     def test_mapping_digest_survives_failure_retry(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "src").mkdir()
             (root / "src/source").write_bytes(b"abc")
@@ -192,7 +192,7 @@ class CandidateHashingTests(unittest.TestCase):
             self.assertEqual(failed[0].retry_entry().expected_hash, expected)
 
     def test_dry_run_hash_reports_changes_without_verification_errors(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory).resolve()
             (root / "source").write_bytes(b"abc")
             (root / "destination").write_bytes(b"abc")
