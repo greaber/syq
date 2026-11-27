@@ -6,7 +6,6 @@ import http.server
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -15,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import syq
+from support import resolved_temporary_directory
 from syq.protocol import parse_find_line
 
 try:
@@ -234,9 +234,7 @@ class FindProtocolTests(unittest.TestCase):
 
 class FakeFindTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory(
-            dir=Path(tempfile.gettempdir()).resolve()
-        )
+        self.temporary_directory = resolved_temporary_directory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
         self.executable = self.root / "syq"
@@ -453,9 +451,7 @@ class FakeFindTests(unittest.TestCase):
 
 class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory(
-            dir=Path(tempfile.gettempdir()).resolve()
-        )
+        self.temporary_directory = resolved_temporary_directory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
         self.executable = self.root / "syq"
@@ -619,7 +615,7 @@ EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
 @unittest.skipUnless(EXECUTABLE, "candidate binary required")
 class CandidateFindTests(unittest.TestCase):
     def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
+        temporary = resolved_temporary_directory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.client = syq.Client(executable=EXECUTABLE, process_cwd=self.root)

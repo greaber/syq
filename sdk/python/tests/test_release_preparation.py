@@ -3,9 +3,9 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
+from support import resolved_temporary_directory
 
 # The release scripts run on the interpreter pinned by scripts/setup.sh and
 # use tomllib, which the oldest Python the package supports does not have.
@@ -22,7 +22,7 @@ class PreparationTests(unittest.TestCase):
     def test_rejects_wrong_version_size_and_hash_before_execution(self):
         content = b"release executable"
         binary = {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             executable = Path(directory) / "syq"
             executable.write_bytes(content)
             for version, expected in (("0.8.0", binary),
@@ -39,7 +39,7 @@ class PreparationTests(unittest.TestCase):
         content = b"release executable"
         manifest = {"version": "0.7.0", "artifacts": {"linux-x86_64": {"binary": {
             "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}}}}
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             executable = Path(directory) / "syq"
             executable.write_bytes(content)
             for replies, succeeds in ((["syq 0.6.0"], False),

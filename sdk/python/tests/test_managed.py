@@ -4,12 +4,12 @@ import gzip
 import hashlib
 import io
 import json
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import syq
+from support import resolved_temporary_directory
 from syq import managed
 
 
@@ -63,7 +63,7 @@ class _Response(io.BytesIO):
 
 class BootstrapTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = resolved_temporary_directory()
         self.cache = Path(self.temporary_directory.name)
 
     def tearDown(self) -> None:

@@ -1,10 +1,10 @@
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, PackagePath
-import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 import syq
+from support import resolved_temporary_directory
 from syq.bundled import bundled_executable
 
 
@@ -14,7 +14,7 @@ class BundledTests(unittest.TestCase):
         self.addCleanup(bundled_executable.cache_clear)
 
     def test_distribution_record_selects_its_own_executable(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             executable = Path(directory) / "syq"
             executable.write_bytes(b"binary")
             package = Mock()

@@ -5,13 +5,13 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import syq
+from support import resolved_temporary_directory
 
 
 class ProcessGroupCleanupTests(unittest.TestCase):
@@ -140,7 +140,7 @@ esac
 
 class ClientTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = resolved_temporary_directory()
         self.executable = Path(self.temporary_directory.name) / "syq"
         self.executable.write_text(FAKE_SYQ, encoding="utf-8")
         self.executable.chmod(0o755)

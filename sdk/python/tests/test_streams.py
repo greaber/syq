@@ -12,10 +12,10 @@ import sys
 import threading
 import subprocess
 import tarfile
-import tempfile
 import unittest
 
 import syq
+from support import resolved_temporary_directory
 
 SYQ = Path(os.environ.get('SYQ_CANDIDATE_EXECUTABLE', Path(__file__).resolve().parents[3] / 'target/debug/syq'))
 
@@ -33,7 +33,7 @@ def ready_stub() -> str:
 
 class StreamTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = resolved_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('SYQ_')}
@@ -509,7 +509,7 @@ class StreamTests(unittest.TestCase):
 
 class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_storage_streams_forward_authorizer_to_the_process(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with resolved_temporary_directory() as temporary:
             fake = Path(temporary) / 'stream-syq'
             fake.write_text(ready_stub())
             fake.chmod(0o700)
@@ -525,7 +525,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     await stream.abort()
 
     async def test_storage_streams_forward_s3_retries(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with resolved_temporary_directory() as temporary:
             fake = Path(temporary) / 'stream-syq'
             fake.write_text(ready_stub())
             fake.chmod(0o700)
@@ -542,7 +542,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     await method(*args, s3_retries=True, **options).__aenter__()
 
     async def test_placement_and_confined_reader(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with resolved_temporary_directory() as temporary:
             root = Path(temporary).resolve()
             target = root / "object"
             client = syq.AsyncClient(executable=SYQ, timeout=10,
@@ -564,7 +564,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     await input.read()
 
     async def test_round_trip_and_cancelled_reader(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with resolved_temporary_directory() as temp:
             root = Path(temp).resolve()
             client = syq.AsyncClient(executable=SYQ, timeout=10)
             async with client.open_writer(as_=root / 'file') as output:
@@ -585,7 +585,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(input._stream._process.process.poll())
 
     async def test_closed_payload_commits_only_after_successful_context(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with resolved_temporary_directory() as temp:
             target = Path(temp).resolve() / 'target'
             client = syq.AsyncClient(executable=SYQ, timeout=10)
             for fail in (False, True):
@@ -607,7 +607,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(target.read_bytes(), b'explicit')
 
     async def test_explicit_abort_inside_context_cancels_normal_exit(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with resolved_temporary_directory() as temp:
             target = Path(temp).resolve() / 'target'
             target.write_bytes(b'old')
             client = syq.AsyncClient(executable=SYQ, timeout=10)
@@ -620,7 +620,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                 await output.commit()
 
     async def test_failed_read_all_reports_transfer_error(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with resolved_temporary_directory() as temp:
             fake = Path(temp).resolve() / 'broken-reader'
             fake.write_text('#!/bin/sh\nprintf \'{"a": 1\'\nexit 1\n')
             fake.chmod(0o700)
@@ -629,7 +629,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     json.loads(await source.read())
 
     async def test_cancelled_commit_reaps_process(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with resolved_temporary_directory() as temp:
             fake = Path(temp).resolve() / 'slow-syq'
             fake.write_text(ready_stub())
             fake.chmod(0o700)

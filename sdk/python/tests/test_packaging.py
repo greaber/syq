@@ -7,11 +7,11 @@ import shutil
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import tarfile
 from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
+from support import resolved_temporary_directory
 
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/stage-python-sdk.py"
@@ -23,7 +23,7 @@ spec.loader.exec_module(staging)
 
 class PackagingTests(unittest.TestCase):
     def test_stage_uses_release_native_source_and_current_python(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
 
@@ -71,7 +71,7 @@ class PackagingTests(unittest.TestCase):
             self.test_stage_uses_release_native_source_and_current_python()
 
     def test_stage_readonly_extracted_source_without_git(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory) / "sdk-checkout"
             native = Path(directory) / "native"
             output = Path(directory) / "out"
@@ -104,7 +104,7 @@ class PackagingTests(unittest.TestCase):
                 staging.make_writable(native)
 
     def test_source_pin_uses_release_tag_instead_of_current_head(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
             script = root / "scripts/pin-python-native-source.py"

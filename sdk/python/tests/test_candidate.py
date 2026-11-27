@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import syq
+from support import resolved_temporary_directory
 
 
 EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
@@ -28,11 +29,6 @@ def reported_version(executable: str | os.PathLike[str]) -> str:
     assert identity == release or identity.startswith(f"{release}+dev."), identity
     return identity.removeprefix("v")
 
-
-def resolved_temporary_directory() -> tempfile.TemporaryDirectory[str]:
-    """Create product-facing fixtures below the physical temporary directory."""
-
-    return tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
 
 
 @unittest.skipUnless(

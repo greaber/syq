@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import syq
+from support import resolved_temporary_directory
 
 
 FAKE_NATIVE = r"""#!/usr/bin/env python3
@@ -263,7 +264,7 @@ def full_nonblocking_pipe() -> tuple[int, io.FileIO]:
 
 class NativeClientTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = resolved_temporary_directory()
         self.root = Path(self.temporary_directory.name)
         self.executable = self.root / "syq"
         self.executable.write_text(FAKE_NATIVE, encoding="utf-8")

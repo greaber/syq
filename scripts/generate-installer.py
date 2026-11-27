@@ -95,6 +95,7 @@ fi
 fetch() {
   if [ "$downloader" = curl ]; then
     curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 \
+      --speed-time 30 --speed-limit 1024 \
       --proto '=https' --proto-redir '=https' --output - "$1"
   else
     wget --quiet --https-only --timeout=10 --tries=3 -O - "$1"

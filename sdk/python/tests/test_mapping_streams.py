@@ -6,6 +6,7 @@ import sys
 import unittest
 
 import syq
+from support import resolved_temporary_directory
 from syq._stream_channel import receive, send
 from syq.models import _mapping_json
 
@@ -55,7 +56,7 @@ class MappingStreamCopies(unittest.TestCase):
         import os
         import tempfile
         from pathlib import Path
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = resolved_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         fixture = Path(self.temp.name).resolve()
         self.root = fixture / "data"

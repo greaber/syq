@@ -37,6 +37,7 @@ fi
 cp "$SYQ_TEST_RELEASE_DIR/${url##*/}" "$output"
 """
 FAKE_CURL = """#!/bin/sh
+[ -z "${SYQ_TEST_ARGS_FILE:-}" ] || printf '%s\\n' "$@" > "$SYQ_TEST_ARGS_FILE"
 output=
 url=
 while [ "$#" -gt 0 ]; do
@@ -47,6 +48,7 @@ while [ "$#" -gt 0 ]; do
 done
 """ + FAKE_DOWNLOAD
 FAKE_WGET = """#!/bin/sh
+[ -z "${SYQ_TEST_ARGS_FILE:-}" ] || printf '%s\\n' "$@" > "$SYQ_TEST_ARGS_FILE"
 output=
 url=
 while [ "$#" -gt 0 ]; do
@@ -218,6 +220,27 @@ esac
         self.assertEqual(self.run_program(self.work / "install-wget/syq", "--test-target"),
                          "linux-x86_64")
         self.assertIn("test fetched syq-linux-x86_64.gz", result.stdout)
+
+    def test_downloaders_set_transfer_timeouts(self):
+        for downloader, expected_pairs in [
+            ("curl", [("--connect-timeout", "10"), ("--speed-time", "30"), ("--speed-limit", "1024")]),
+            ("wget", [("--timeout=10", None)]),
+        ]:
+            with self.subTest(downloader=downloader):
+                args_file = self.work / f"args-{downloader}.txt"
+                result = self.install(
+                    self.work / f"install-timeouts-{downloader}",
+                    shell="/bin/sh",
+                    path=str(self.tool_path(downloader)),
+                    SYQ_TEST_ARGS_FILE=str(args_file),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+                argv = args_file.read_text().splitlines()
+                for flag, value in expected_pairs:
+                    self.assertIn(flag, argv)
+                    if value is not None:
+                        index = argv.index(flag)
+                        self.assertEqual(argv[index + 1], value)
 
     def test_the_archive_follows_whether_zstd_is_installed(self):
         for zstd, expected in [("fake", "zstd"), (None, "gzip")]:

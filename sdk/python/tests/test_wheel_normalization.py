@@ -7,9 +7,9 @@ import importlib.util
 import io
 import json
 from pathlib import Path
-import tempfile
 import unittest
 import zipfile
+from support import resolved_temporary_directory
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/normalize-python-wheel.py"
 spec = importlib.util.spec_from_file_location("normalize_python_wheel", SCRIPT)
@@ -49,7 +49,7 @@ def fixture(path, source_root):
 
 class WheelNormalizationTests(unittest.TestCase):
     def test_different_build_roots_produce_same_wheel_and_keep_payloads(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             a, b = (Path(directory) / name for name in ("a.whl", "b.whl"))
             fixture(a, "/tmp/one")
             fixture(b, "/private/var/two")
@@ -86,7 +86,7 @@ class WheelNormalizationTests(unittest.TestCase):
             self.assertEqual(a.read_bytes(), normalized)
 
     def test_unknown_sbom_layout_leaves_original_wheel_untouched(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with resolved_temporary_directory() as directory:
             wheel = Path(directory) / "a.whl"
             with zipfile.ZipFile(wheel, "w") as archive:
                 archive.writestr(SBOM, b'{"metadata":{"component":{"bom-ref":"unexpected"}}}')
