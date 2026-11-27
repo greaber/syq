@@ -31,6 +31,11 @@ esac
 FAKE_DOWNLOAD = """
 echo "test fetched ${url##*/}" >&2
 [ -z "${SYQ_TEST_ENDLESS_DOWNLOAD:-}" ] || exec yes
+if [ -n "${SYQ_TEST_STALL_ONCE_MARKER:-}" ] && [ ! -e "$SYQ_TEST_STALL_ONCE_MARKER" ]; then
+  : > "$SYQ_TEST_STALL_ONCE_MARKER"
+  head -c 10 "$SYQ_TEST_RELEASE_DIR/${url##*/}"
+  exit 28
+fi
 if [ "$output" = - ]; then
   exec cat "$SYQ_TEST_RELEASE_DIR/${url##*/}"
 fi
@@ -203,7 +208,7 @@ esac
                                  if shutil.which(candidate)), None)
         self.assertIsNotNone(checksum_utility)
         for utility in ["cat", "chmod", "cp", "gzip", "head", "mkdir", "mktemp", "mv", "rm", "sed",
-                        "tr", "wc", "yes", checksum_utility]:
+                        "sleep", "tr", "wc", "yes", checksum_utility]:
             (tools / utility).symlink_to(shutil.which(utility))
         shutil.copy(self.fakebin / "uname", tools / "uname")
         executable(tools / downloader, FAKE_CURL if downloader == "curl" else FAKE_WGET)
@@ -223,8 +228,8 @@ esac
 
     def test_downloaders_set_transfer_timeouts(self):
         for downloader, expected_pairs in [
-            ("curl", [("--connect-timeout", "10"), ("--speed-time", "30"), ("--speed-limit", "1024")]),
-            ("wget", [("--timeout=10", None)]),
+            ("curl", [("--retry", "0"), ("--connect-timeout", "10"), ("--speed-time", "30"), ("--speed-limit", "1024")]),
+            ("wget", [("--timeout=10", None), ("--tries=1", None)]),
         ]:
             with self.subTest(downloader=downloader):
                 args_file = self.work / f"args-{downloader}.txt"
@@ -241,6 +246,22 @@ esac
                     if value is not None:
                         index = argv.index(flag)
                         self.assertEqual(argv[index + 1], value)
+
+    def test_mid_transfer_stall_retries_without_appending_partial_bytes(self):
+        for downloader in ("curl", "wget"):
+            with self.subTest(downloader=downloader):
+                marker = self.work / f"stalled-{downloader}"
+                install_dir = self.work / f"install-stall-{downloader}"
+                result = self.install(
+                    install_dir,
+                    shell="/bin/sh",
+                    path=str(self.tool_path(downloader)),
+                    SYQ_TEST_STALL_ONCE_MARKER=str(marker),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertTrue(marker.exists())
+                self.assertEqual(result.stdout.count("test fetched syq-linux-x86_64.gz"), 2)
+                self.assertEqual(self.run_program(install_dir / "syq", "--version"), "syq 0.1.0")
 
     def test_the_archive_follows_whether_zstd_is_installed(self):
         for zstd, expected in [("fake", "zstd"), (None, "gzip")]:
