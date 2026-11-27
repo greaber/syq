@@ -18,7 +18,6 @@ from support import (
     assert_descendant_exited,
     async_assert_descendant_exited,
     resolved_temporary_directory,
-    warm_executable,
 )
 from syq.protocol import parse_find_line
 
@@ -245,7 +244,6 @@ class FakeFindTests(unittest.TestCase):
         cls._shared_executable = Path(cls._executable_dir.name) / "syq"
         cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
         cls._shared_executable.chmod(0o755)
-        warm_executable(cls._shared_executable, "--version")
 
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()
@@ -468,7 +466,6 @@ class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
         cls._shared_executable = Path(cls._executable_dir.name) / "syq"
         cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
         cls._shared_executable.chmod(0o755)
-        warm_executable(cls._shared_executable, "--version")
 
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()

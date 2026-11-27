@@ -515,7 +515,6 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
         cls._ready_stub = Path(cls._stub_dir.name) / 'ready-syq'
         cls._ready_stub.write_text(ready_stub())
         cls._ready_stub.chmod(0o700)
-        warm_executable(cls._ready_stub, '--noop')
 
     async def test_storage_streams_forward_authorizer_to_the_process(self):
         client = syq.AsyncClient(executable=self._ready_stub, timeout=5)

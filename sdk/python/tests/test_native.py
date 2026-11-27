@@ -10,11 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import syq
-from support import (
-    assert_descendant_exited,
-    resolved_temporary_directory,
-    warm_executable,
-)
+from support import assert_descendant_exited, resolved_temporary_directory
 
 
 FAKE_NATIVE = r"""#!/usr/bin/env python3
@@ -38,7 +34,7 @@ if marker:
         "tmp = pathlib.Path(sys.argv[1] + '.ready.tmp')\n"
         "tmp.write_text(str(os.getpid()))\n"
         "os.replace(tmp, sys.argv[1] + '.ready')\n"
-        "time.sleep(60)\n",
+        "time.sleep(10)\n",
         marker,
     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
        stderr=subprocess.DEVNULL)
@@ -282,7 +278,6 @@ class NativeClientTests(unittest.TestCase):
         cls._shared_executable = Path(cls._executable_dir.name) / "syq"
         cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
         cls._shared_executable.chmod(0o755)
-        warm_executable(cls._shared_executable, "--version")
 
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()

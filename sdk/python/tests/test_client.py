@@ -131,7 +131,7 @@ elif command in ("spawn-descendant", "interrupt"):
         with open(tmp, "w", encoding="utf-8") as ready_file:
             ready_file.write(str(os.getpid()))
         os.replace(tmp, marker + ".ready")
-        time.sleep(60)
+        time.sleep(10)
         os._exit(0)
     deadline = time.monotonic() + 5
     while not os.path.exists(marker + ".ready"):
