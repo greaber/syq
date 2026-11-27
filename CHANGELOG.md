@@ -4,7 +4,7 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
-## 0.11.0 — 2026-11-26
+## 0.11.0 — 2026-11-27
 
 Changes since 0.10.1. Syq adds `syq find` and `syq ls` across local
 filesystems, SSH servers and S3 buckets (with Python SDK support), copies
