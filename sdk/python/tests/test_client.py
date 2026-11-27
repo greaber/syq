@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest import mock
 
 import syq
-from support import resolved_temporary_directory
+from support import (
+    assert_descendant_exited,
+    resolved_temporary_directory,
+    warm_executable,
+)
 
 
 class ProcessGroupCleanupTests(unittest.TestCase):
@@ -94,56 +98,64 @@ class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
             process.wait.assert_awaited_once()
 
 
-FAKE_SYQ = """#!/bin/sh
-case "$1" in
-  --version)
-    printf 'syq 9.8.7\\n'
-    ;;
-  emit)
-    printf '%s' "$2"
-    printf 'diagnostic' >&2
-    ;;
-  fail)
-    printf 'partial'
-    printf 'failed' >&2
-    exit 23
-    ;;
-  spawn-descendant)
-    (
-      printf 'ready' > "$2.ready"
-      sleep 1
-      printf 'survived' > "$2"
-    ) &
-    while [ ! -f "$2.ready" ]; do
-      sleep 0.01
-    done
-    sleep 30
-    ;;
-  interrupt)
-    printf '%s' "$$" > "$2.pid"
-    (
-      printf 'ready' > "$2.ready"
-      sleep 1
-      printf 'survived' > "$2"
-    ) &
-    while [ ! -f "$2.ready" ]; do
-      sleep 0.01
-    done
-    sleep 3
-    ;;
-  *)
-    exit 2
-    ;;
-esac
+FAKE_SYQ = f"""#!{sys.executable}
+import fcntl
+import os
+import sys
+import time
+
+command = sys.argv[1] if len(sys.argv) > 1 else ""
+if command == "--version":
+    sys.stdout.write("syq 9.8.7\\n")
+elif command == "emit":
+    sys.stdout.write(sys.argv[2])
+    sys.stderr.write("diagnostic")
+elif command == "fail":
+    sys.stdout.write("partial")
+    sys.stderr.write("failed")
+    raise SystemExit(23)
+elif command in ("spawn-descendant", "interrupt"):
+    marker = sys.argv[2]
+    if command == "interrupt":
+        with open(marker + ".pid", "w", encoding="utf-8") as pid_file:
+            pid_file.write(str(os.getpid()))
+    if os.fork() == 0:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        lock = open(marker + ".lock", "wb")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tmp = marker + ".ready.tmp"
+        with open(tmp, "w", encoding="utf-8") as ready_file:
+            ready_file.write(str(os.getpid()))
+        os.replace(tmp, marker + ".ready")
+        time.sleep(60)
+        os._exit(0)
+    deadline = time.monotonic() + 5
+    while not os.path.exists(marker + ".ready"):
+        if time.monotonic() >= deadline:
+            raise SystemExit("fake descendant did not become ready")
+        time.sleep(0.005)
+    time.sleep(30 if command == "spawn-descendant" else 3)
+else:
+    raise SystemExit(2)
 """
 
 
 class ClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._executable_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._executable_dir.cleanup)
+        cls.executable = Path(cls._executable_dir.name) / "syq"
+        cls.executable.write_text(FAKE_SYQ, encoding="utf-8")
+        cls.executable.chmod(0o755)
+        warm_executable(cls.executable, "--version")
+
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()
-        self.executable = Path(self.temporary_directory.name) / "syq"
-        self.executable.write_text(FAKE_SYQ, encoding="utf-8")
-        self.executable.chmod(0o755)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -199,9 +211,7 @@ class ClientTests(unittest.TestCase):
                 timeout=0.5,
             )
 
-        self.assertTrue(marker.with_suffix(".ready").exists())
-        time.sleep(0.75)
-        self.assertFalse(marker.exists())
+        assert_descendant_exited(self, marker)
 
     def test_keyboard_interrupt_stops_spawned_descendants(self) -> None:
         marker = Path(self.temporary_directory.name) / "interrupt-marker"
@@ -242,8 +252,7 @@ class ClientTests(unittest.TestCase):
             wrapper.communicate(timeout=3)
 
             self.assertNotEqual(wrapper.returncode, 0)
-            time.sleep(1.1)
-            self.assertFalse(marker.exists())
+            assert_descendant_exited(self, marker)
         finally:
             if wrapper.poll() is None:
                 wrapper.kill()

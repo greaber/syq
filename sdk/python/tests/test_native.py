@@ -5,13 +5,16 @@ import io
 import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import syq
-from support import resolved_temporary_directory
+from support import (
+    assert_descendant_exited,
+    resolved_temporary_directory,
+    warm_executable,
+)
 
 
 FAKE_NATIVE = r"""#!/usr/bin/env python3
@@ -27,14 +30,23 @@ if args == ["--version"]:
     raise SystemExit(0)
 marker = os.environ.get("SYQ_FAKE_DESCENDANT")
 if marker:
-    descendant_delay = os.environ.get("SYQ_FAKE_DESCENDANT_DELAY", "0.6")
     subprocess.Popen([
         sys.executable, "-c",
-        "import pathlib,sys,time; time.sleep(float(sys.argv[2])); pathlib.Path(sys.argv[1]).write_text('survived')",
-        marker, descendant_delay,
+        "import fcntl,os,pathlib,sys,time\n"
+        "lock = open(sys.argv[1] + '.lock', 'wb')\n"
+        "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        "tmp = pathlib.Path(sys.argv[1] + '.ready.tmp')\n"
+        "tmp.write_text(str(os.getpid()))\n"
+        "os.replace(tmp, sys.argv[1] + '.ready')\n"
+        "time.sleep(60)\n",
+        marker,
     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
        stderr=subprocess.DEVNULL)
-    open(marker + ".ready", "w").close()
+    deadline = time.monotonic() + 5
+    while not os.path.exists(marker + ".ready"):
+        if time.monotonic() >= deadline:
+            raise SystemExit("fake descendant did not acquire lock")
+        time.sleep(0.005)
 pause = os.environ.get("SYQ_FAKE_PAUSE")
 if pause:
     time.sleep(float(pause))
@@ -263,12 +275,19 @@ def full_nonblocking_pipe() -> tuple[int, io.FileIO]:
 
 
 class NativeClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._executable_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._executable_dir.cleanup)
+        cls._shared_executable = Path(cls._executable_dir.name) / "syq"
+        cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
+        cls._shared_executable.chmod(0o755)
+        warm_executable(cls._shared_executable, "--version")
+
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()
         self.root = Path(self.temporary_directory.name)
-        self.executable = self.root / "syq"
-        self.executable.write_text(FAKE_NATIVE, encoding="utf-8")
-        self.executable.chmod(0o755)
+        self.executable = self._shared_executable
         self.argv_log = self.root / "argv.json"
         self.env = {**os.environ, "SYQ_FAKE_ARGV": os.fspath(self.argv_log)}
         self.client = syq.Client(executable=self.executable, env=self.env)
@@ -1030,9 +1049,7 @@ class NativeClientTests(unittest.TestCase):
         with mock.patch("syq.client._kill_process_group", side_effect=kill_after_exit):
             with self.assertRaisesRegex(syq.SyqProtocolError, "terminal result"):
                 client.cp("source", into="target")
-        self.assertTrue(marker.with_suffix(".ready").exists())
-        time.sleep(0.8)
-        self.assertFalse(marker.exists())
+        assert_descendant_exited(self, marker)
 
     def test_callback_failure_kills_the_owned_process_group(self) -> None:
         marker = self.root / "descendant"
@@ -1046,9 +1063,7 @@ class NativeClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "callback failed"):
             client.cp("source", into="target", on_event=fail)
-        self.assertTrue(marker.with_suffix(".ready").exists())
-        time.sleep(0.8)
-        self.assertFalse(marker.exists())
+        assert_descendant_exited(self, marker)
 
 
 if __name__ == "__main__":

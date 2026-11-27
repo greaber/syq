@@ -12,7 +12,11 @@ from pathlib import Path
 from unittest import mock
 
 import syq
-from support import resolved_temporary_directory
+from support import (
+    async_assert_descendant_exited,
+    resolved_temporary_directory,
+    warm_executable,
+)
 
 try:
     from test_native import FAKE_NATIVE, full_nonblocking_pipe
@@ -31,12 +35,19 @@ sys.stdout.buffer.write(data.upper())
 
 
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._executable_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._executable_dir.cleanup)
+        cls._shared_executable = Path(cls._executable_dir.name) / "syq"
+        cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
+        cls._shared_executable.chmod(0o755)
+        warm_executable(cls._shared_executable, "--version")
+
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()
         self.root = Path(self.temporary_directory.name)
-        self.executable = self.root / "syq"
-        self.executable.write_text(FAKE_NATIVE, encoding="utf-8")
-        self.executable.chmod(0o755)
+        self.executable = self._shared_executable
         self.argv_log = self.root / "argv.json"
         self.env = {**os.environ, "SYQ_FAKE_ARGV": os.fspath(self.argv_log)}
         self.client = syq.AsyncClient(executable=self.executable, env=self.env)
@@ -542,15 +553,12 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             env={
                 **self.env,
                 "SYQ_FAKE_DESCENDANT": os.fspath(marker),
-                "SYQ_FAKE_DESCENDANT_DELAY": "0.6",
                 "SYQ_FAKE_SHAPE": "truncated",
             },
         )
         with self.assertRaisesRegex(syq.SyqProtocolError, "terminal result"):
             await client.cp("source", into="target")
-        self.assertTrue(marker.with_suffix(".ready").exists())
-        await asyncio.sleep(0.8)
-        self.assertFalse(marker.exists())
+        await async_assert_descendant_exited(self, marker)
 
     async def test_early_map_context_exit_kills_the_process_group(self) -> None:
         marker = self.root / "map-descendant"
@@ -569,8 +577,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                     self.fail("fake syq map did not become ready")
                 await asyncio.sleep(0.01)
 
-        await asyncio.sleep(0.8)
-        self.assertFalse(marker.exists())
+        await async_assert_descendant_exited(self, marker)
 
     async def test_raw_run_does_not_block_the_event_loop(self) -> None:
         executable = self.root / "raw-process"
@@ -604,8 +611,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        await asyncio.sleep(0.8)
-        self.assertFalse(marker.exists())
+        await async_assert_descendant_exited(self, marker)
 
     async def test_timeout_kills_and_reaps_the_process_group(self) -> None:
         marker = self.root / "timed-out-descendant"
@@ -614,7 +620,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             env={
                 **self.env,
                 "SYQ_FAKE_DESCENDANT": os.fspath(marker),
-                "SYQ_FAKE_DESCENDANT_DELAY": "2",
                 "SYQ_FAKE_PAUSE": "10",
             },
             timeout=1.0,
@@ -622,9 +627,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(asyncio.TimeoutError):
             await client.cp("source", into="target")
-        self.assertTrue(marker.with_suffix(".ready").exists())
-        await asyncio.sleep(1.2)
-        self.assertFalse(marker.exists())
+        await async_assert_descendant_exited(self, marker)
 
 
 if __name__ == "__main__":

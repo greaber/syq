@@ -14,7 +14,12 @@ from pathlib import Path
 from unittest import mock
 
 import syq
-from support import resolved_temporary_directory
+from support import (
+    assert_descendant_exited,
+    async_assert_descendant_exited,
+    resolved_temporary_directory,
+    warm_executable,
+)
 from syq.protocol import parse_find_line
 
 try:
@@ -233,13 +238,20 @@ class FindProtocolTests(unittest.TestCase):
 
 
 class FakeFindTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._executable_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._executable_dir.cleanup)
+        cls._shared_executable = Path(cls._executable_dir.name) / "syq"
+        cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
+        cls._shared_executable.chmod(0o755)
+        warm_executable(cls._shared_executable, "--version")
+
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
-        self.executable = self.root / "syq"
-        self.executable.write_text(FAKE_NATIVE, encoding="utf-8")
-        self.executable.chmod(0o755)
+        self.executable = self._shared_executable
         self.argv_log = self.root / "argv.json"
         self.env = {**os.environ, "SYQ_FAKE_ARGV": os.fspath(self.argv_log)}
         self.client = syq.Client(executable=self.executable, env=self.env)
@@ -445,18 +457,24 @@ class FakeFindTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("fake syq find did not become ready")
                 time.sleep(0.01)
-        time.sleep(0.8)
-        self.assertFalse(marker.exists())
+        assert_descendant_exited(self, marker)
 
 
 class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._executable_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._executable_dir.cleanup)
+        cls._shared_executable = Path(cls._executable_dir.name) / "syq"
+        cls._shared_executable.write_text(FAKE_NATIVE, encoding="utf-8")
+        cls._shared_executable.chmod(0o755)
+        warm_executable(cls._shared_executable, "--version")
+
     def setUp(self) -> None:
         self.temporary_directory = resolved_temporary_directory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
-        self.executable = self.root / "syq"
-        self.executable.write_text(FAKE_NATIVE, encoding="utf-8")
-        self.executable.chmod(0o755)
+        self.executable = self._shared_executable
         self.argv_log = self.root / "argv.json"
         self.env = {**os.environ, "SYQ_FAKE_ARGV": os.fspath(self.argv_log)}
         self.client = syq.AsyncClient(executable=self.executable, env=self.env)
@@ -605,8 +623,7 @@ class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
                 if time.monotonic() >= deadline:
                     self.fail("fake syq find did not become ready")
                 await asyncio.sleep(0.01)
-        await asyncio.sleep(0.8)
-        self.assertFalse(marker.exists())
+        await async_assert_descendant_exited(self, marker)
 
 
 EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
