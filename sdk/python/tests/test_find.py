@@ -234,7 +234,9 @@ class FindProtocolTests(unittest.TestCase):
 
 class FakeFindTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            dir=Path(tempfile.gettempdir()).resolve()
+        )
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
         self.executable = self.root / "syq"
@@ -451,7 +453,9 @@ class FakeFindTests(unittest.TestCase):
 
 class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            dir=Path(tempfile.gettempdir()).resolve()
+        )
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
         self.executable = self.root / "syq"
