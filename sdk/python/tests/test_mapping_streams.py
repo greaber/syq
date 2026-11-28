@@ -54,7 +54,6 @@ class MappingStreamTypes(unittest.TestCase):
 class MappingStreamCopies(unittest.TestCase):
     def setUp(self):
         import os
-        import tempfile
         from pathlib import Path
         self.temp = resolved_temporary_directory()
         self.addCleanup(self.temp.cleanup)

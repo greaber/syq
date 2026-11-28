@@ -15,7 +15,7 @@ import tarfile
 import unittest
 
 import syq
-from support import resolved_temporary_directory
+from support import resolved_temporary_directory, warm_executable
 
 SYQ = Path(os.environ.get('SYQ_CANDIDATE_EXECUTABLE', Path(__file__).resolve().parents[3] / 'target/debug/syq'))
 
@@ -27,11 +27,21 @@ def ready_stub() -> str:
     ready = dict(schema="syq.automation", schema_version=4, seq=1, type="stream_ready")
     data = (json.dumps(run) + "\n" + json.dumps(ready) + "\n").encode()
     return (f'#!{sys.executable}\nimport os, sys, time\n'
+            'if "--noop" in sys.argv:\n'
+            '    raise SystemExit(0)\n'
             f'os.write(int(sys.argv[sys.argv.index("--results-fd") + 1]), {data!r})\n'
             'time.sleep(60)\n')
 
 
 class StreamTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._stub_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._stub_dir.cleanup)
+        cls._ready_stub = Path(cls._stub_dir.name) / 'ready-syq'
+        cls._ready_stub.write_text(ready_stub())
+        cls._ready_stub.chmod(0o700)
+        warm_executable(cls._ready_stub, '--noop')
     def setUp(self):
         self.temp = resolved_temporary_directory()
         self.addCleanup(self.temp.cleanup)
@@ -453,10 +463,7 @@ class StreamTests(unittest.TestCase):
                 self.assertFalse(target.exists())
 
     def test_storage_streams_forward_authorizer_to_the_process(self):
-        fake = self.root / 'stream-syq'
-        fake.write_text(ready_stub())
-        fake.chmod(0o700)
-        client = syq.Client(executable=fake, timeout=5)
+        client = syq.Client(executable=self._ready_stub, timeout=5)
         for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
                                       (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
             stream = method(*args, auth_from='@laptop', **options)
@@ -467,10 +474,7 @@ class StreamTests(unittest.TestCase):
                 stream.abort()
 
     def test_writer_forwards_object_writing_headers(self):
-        fake = self.root / 'stream-syq'
-        fake.write_text(ready_stub())
-        fake.chmod(0o700)
-        client = syq.Client(executable=fake, timeout=5)
+        client = syq.Client(executable=self._ready_stub, timeout=5)
         stream = client.open_writer(to='s3://bucket', as_='key',
                                     s3_write_header=['x-amz-storage-class: STANDARD_IA'])
         try:
@@ -481,10 +485,7 @@ class StreamTests(unittest.TestCase):
             stream.abort()
 
     def test_storage_streams_forward_s3_retries(self):
-        fake = self.root / 'stream-syq'
-        fake.write_text(ready_stub())
-        fake.chmod(0o700)
-        client = syq.Client(executable=fake, timeout=5)
+        client = syq.Client(executable=self._ready_stub, timeout=5)
         for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
                                       (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
             stream = method(*args, s3_retries=0, **options)
@@ -497,49 +498,48 @@ class StreamTests(unittest.TestCase):
                     method(*args, s3_retries=value, **options)
 
     def test_timeout_interrupts_blocking_write_and_reaps_child(self):
-        fake = self.root / 'slow-syq'
-        fake.write_text(ready_stub())
-        fake.chmod(0o700)
-        client = syq.Client(executable=fake, timeout=.1)
+        client = syq.Client(executable=self._ready_stub, timeout=.1)
+        output = None
         with self.assertRaises(subprocess.TimeoutExpired):
             with client.open_writer(as_='ignored') as output:
                 output.write(b'x' * (1 << 20))
+        self.assertIsNotNone(output)
         self.assertIsNotNone(output._process.process.poll())
 
 
 class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._stub_dir = resolved_temporary_directory()
+        cls.addClassCleanup(cls._stub_dir.cleanup)
+        cls._ready_stub = Path(cls._stub_dir.name) / 'ready-syq'
+        cls._ready_stub.write_text(ready_stub())
+        cls._ready_stub.chmod(0o700)
+
     async def test_storage_streams_forward_authorizer_to_the_process(self):
-        with resolved_temporary_directory() as temporary:
-            fake = Path(temporary) / 'stream-syq'
-            fake.write_text(ready_stub())
-            fake.chmod(0o700)
-            client = syq.AsyncClient(executable=fake, timeout=5)
-            for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
-                                          (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
-                stream = method(*args, auth_from='@laptop', **options)
-                await stream.__aenter__()
-                try:
-                    argv = stream._stream._process.process.args
-                    self.assertEqual(argv[argv.index('--auth-from') + 1], '@laptop')
-                finally:
-                    await stream.abort()
+        client = syq.AsyncClient(executable=self._ready_stub, timeout=5)
+        for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
+                                      (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
+            stream = method(*args, auth_from='@laptop', **options)
+            await stream.__aenter__()
+            try:
+                argv = stream._stream._process.process.args
+                self.assertEqual(argv[argv.index('--auth-from') + 1], '@laptop')
+            finally:
+                await stream.abort()
 
     async def test_storage_streams_forward_s3_retries(self):
-        with resolved_temporary_directory() as temporary:
-            fake = Path(temporary) / 'stream-syq'
-            fake.write_text(ready_stub())
-            fake.chmod(0o700)
-            client = syq.AsyncClient(executable=fake, timeout=5)
-            for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
-                                          (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
-                stream = method(*args, s3_retries=7, **options)
-                await stream.__aenter__()
-                try:
-                    self.assertIn('--s3-retries=7', stream._stream._process.process.args)
-                finally:
-                    await stream.abort()
-                with self.assertRaisesRegex(syq.SyqInvocationError, 's3_retries'):
-                    await method(*args, s3_retries=True, **options).__aenter__()
+        client = syq.AsyncClient(executable=self._ready_stub, timeout=5)
+        for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
+                                      (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
+            stream = method(*args, s3_retries=7, **options)
+            await stream.__aenter__()
+            try:
+                self.assertIn('--s3-retries=7', stream._stream._process.process.args)
+            finally:
+                await stream.abort()
+            with self.assertRaisesRegex(syq.SyqInvocationError, 's3_retries'):
+                await method(*args, s3_retries=True, **options).__aenter__()
 
     async def test_placement_and_confined_reader(self):
         with resolved_temporary_directory() as temporary:
@@ -571,10 +571,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                 await output.write(b'async bytes')
             async with client.open_reader(root / 'file') as input:
                 self.assertEqual(await input.read(), b'async bytes')
-            fake = root / 'slow-syq'
-            fake.write_text(ready_stub())
-            fake.chmod(0o700)
-            client = syq.AsyncClient(executable=fake)
+            client = syq.AsyncClient(executable=self._ready_stub)
             input = client.open_reader('ignored')
             await input.__aenter__()
             task = asyncio.create_task(input.read(1))
@@ -629,15 +626,11 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     json.loads(await source.read())
 
     async def test_cancelled_commit_reaps_process(self):
-        with resolved_temporary_directory() as temp:
-            fake = Path(temp).resolve() / 'slow-syq'
-            fake.write_text(ready_stub())
-            fake.chmod(0o700)
-            output = syq.AsyncClient(executable=fake).open_writer(as_='ignored')
-            await output.__aenter__()
-            task = asyncio.create_task(output.commit())
-            await asyncio.sleep(.05)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 10)
-            self.assertIsNotNone(output._stream._process.process.poll())
+        output = syq.AsyncClient(executable=self._ready_stub).open_writer(as_='ignored')
+        await output.__aenter__()
+        task = asyncio.create_task(output.commit())
+        await asyncio.sleep(.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        self.assertIsNotNone(output._stream._process.process.poll())
