@@ -5,7 +5,6 @@ import asyncio
 import math
 import json
 import os
-import signal
 import subprocess
 import threading
 from collections.abc import Awaitable, Callable, Mapping
@@ -79,20 +78,10 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
     return argv
 
 
-def _signal_group(process: subprocess.Popen[bytes], sig: int) -> None:
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        # Darwin may report EPERM for a group containing only zombies.
-        if process.poll() is None:
-            raise
-        process.wait()
-        try:
-            os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            pass
+def _kill_group(process: subprocess.Popen[bytes]) -> None:
+    from .client import _kill_process_group
+
+    _kill_process_group(process)
 
 
 class _Process:
@@ -205,7 +194,7 @@ class _Process:
                         and not self.results_drain.is_alive()):
                     return
                 self.cleanup_expired = True
-                _signal_group(self.process, signal.SIGKILL)
+                _kill_group(self.process)
                 return
             # Let the coordinator close its helper sessions and discard staging.
             # Signalling the entire group here also kills local SSH helpers before
@@ -213,7 +202,7 @@ class _Process:
             self.process.terminate()
             if not self.done.wait(6):
                 self.cleanup_expired = True
-                _signal_group(self.process, signal.SIGKILL)
+                _kill_group(self.process)
 
     def _release(self) -> None:
         with self._release_lock:
@@ -264,7 +253,7 @@ class _Process:
             except subprocess.TimeoutExpired:
                 pass
             finally:
-                _signal_group(self.process, signal.SIGKILL)
+                _kill_group(self.process)
                 self.process.wait()
                 self._release()
 

@@ -67,6 +67,8 @@ _FIND_INCLUDE_FIELDS = frozenset({
 _MAX_STREAM_LINE_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
 _REAP_WAIT_TIMEOUT = 0.5
+_REAP_RETRY_TIMEOUT = 0.5
+_REAP_RETRY_INTERVAL = 0.005
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,16 +278,25 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except PermissionError as error:
-            # Darwin can report EPERM for a group containing only zombies, or
-            # a leader that has closed its pipes but not finished exiting, so
-            # cannot be reaped yet. Wait briefly to reap our leader, then retry
-            # so surviving descendants still receive the signal, as the async
-            # client does. A live process keeps the permission failure visible.
+            # Darwin can report EPERM for a group containing only zombies,
+            # including an unreaped leader or an exited descendant waiting
+            # for PID 1 to reap it. Wait briefly to reap our leader, then
+            # retry until the group vanishes or a live descendant is
+            # signalled. A live leader or persistent EPERM stays visible.
             try:
                 process.wait(timeout=_REAP_WAIT_TIMEOUT)
             except subprocess.TimeoutExpired as timeout:
                 raise error from timeout
-            os.killpg(process.pid, signal.SIGKILL)
+            deadline = time.monotonic() + _REAP_RETRY_TIMEOUT
+            while True:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    return
+                except PermissionError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(_REAP_RETRY_INTERVAL, remaining))
     except ProcessLookupError:
         pass
 

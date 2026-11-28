@@ -54,19 +54,55 @@ class ProcessGroupCleanupTests(unittest.TestCase):
                     mock.call(123, signal.SIGKILL), mock.call(123, signal.SIGKILL),
                 ])
 
+    def test_permission_error_waits_for_transient_zombie_descendant_reap(self):
+        from syq.client import _kill_process_group
+
+        process = mock.Mock(pid=123, wait=mock.Mock(return_value=0))
+        for final in (None, ProcessLookupError()):
+            with self.subTest(final=final), mock.patch(
+                "syq.client._REAP_RETRY_INTERVAL", 0.001
+            ), mock.patch(
+                "syq.client.os.killpg",
+                side_effect=[PermissionError(), PermissionError(), final],
+            ) as kill:
+                _kill_process_group(process)
+                self.assertEqual(kill.call_args_list, [
+                    mock.call(123, signal.SIGKILL),
+                    mock.call(123, signal.SIGKILL),
+                    mock.call(123, signal.SIGKILL),
+                ])
+
     def test_permission_errors_for_live_or_remaining_group_are_visible(self):
         from syq.client import _kill_process_group
 
         live = subprocess.TimeoutExpired("syq", 0.5)
-        for wait, attempts in ((live, 1), (0, 2)):
+        for wait, min_attempts in ((live, 1), (0, 2)):
             with self.subTest(wait=wait), mock.patch(
+                "syq.client._REAP_RETRY_TIMEOUT", 0.01
+            ), mock.patch(
+                "syq.client._REAP_RETRY_INTERVAL", 0.001
+            ), mock.patch(
                 "syq.client.os.killpg", side_effect=PermissionError("denied")
             ) as kill:
                 process = mock.Mock(pid=123, wait=mock.Mock(side_effect=[wait]))
                 with self.assertRaisesRegex(PermissionError, "denied"):
                     _kill_process_group(process)
-                self.assertEqual(kill.call_count, attempts)
+                if wait is live:
+                    self.assertEqual(kill.call_count, 1)
+                else:
+                    self.assertGreaterEqual(kill.call_count, min_attempts)
                 process.wait.assert_called_once_with(timeout=0.5)
+
+    def test_stream_kill_group_retries_transient_zombie_descendant_eperm(self):
+        from syq._streams import _kill_group
+
+        process = mock.Mock(pid=123, wait=mock.Mock(return_value=0))
+        with mock.patch("syq.client._REAP_RETRY_INTERVAL", 0.001), mock.patch(
+            "syq.client.os.killpg",
+            side_effect=[PermissionError(), PermissionError(), ProcessLookupError()],
+        ) as kill:
+            _kill_group(process)
+            self.assertEqual(kill.call_count, 3)
 
 
 class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
@@ -84,18 +120,45 @@ class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
                     mock.call(123, signal.SIGKILL), mock.call(123, signal.SIGKILL),
                 ])
 
-    async def test_live_process_permission_error_is_visible(self):
+    async def test_permission_error_waits_for_transient_zombie_descendant_reap(self):
         from syq.async_client import _kill_process_group
 
-        process = mock.Mock(pid=123, returncode=None)
-        process.wait = mock.AsyncMock(side_effect=asyncio.TimeoutError)
-        with mock.patch(
-            "syq.async_client.os.killpg", side_effect=PermissionError("denied")
-        ) as kill:
-            with self.assertRaisesRegex(PermissionError, "denied"):
+        process = mock.Mock(pid=123, returncode=0)
+        process.wait = mock.AsyncMock(return_value=0)
+        for final in (None, ProcessLookupError()):
+            with self.subTest(final=final), mock.patch(
+                "syq.async_client._REAP_RETRY_INTERVAL", 0.001
+            ), mock.patch(
+                "syq.async_client.os.killpg",
+                side_effect=[PermissionError(), PermissionError(), final],
+            ) as kill:
                 await _kill_process_group(process)
-            self.assertEqual(kill.call_count, 1)
-            process.wait.assert_awaited_once()
+                self.assertEqual(kill.call_args_list, [
+                    mock.call(123, signal.SIGKILL),
+                    mock.call(123, signal.SIGKILL),
+                    mock.call(123, signal.SIGKILL),
+                ])
+
+    async def test_live_or_remaining_group_permission_error_is_visible(self):
+        from syq.async_client import _kill_process_group
+
+        for wait_result, is_live in ((asyncio.TimeoutError(), True), (0, False)):
+            process = mock.Mock(pid=123, returncode=None)
+            process.wait = mock.AsyncMock(side_effect=[wait_result])
+            with self.subTest(is_live=is_live), mock.patch(
+                "syq.async_client._REAP_RETRY_TIMEOUT", 0.01
+            ), mock.patch(
+                "syq.async_client._REAP_RETRY_INTERVAL", 0.001
+            ), mock.patch(
+                "syq.async_client.os.killpg", side_effect=PermissionError("denied")
+            ) as kill:
+                with self.assertRaisesRegex(PermissionError, "denied"):
+                    await _kill_process_group(process)
+                if is_live:
+                    self.assertEqual(kill.call_count, 1)
+                else:
+                    self.assertGreaterEqual(kill.call_count, 2)
+                process.wait.assert_awaited_once()
 
 
 FAKE_SYQ = f"""#!{sys.executable}

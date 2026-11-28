@@ -8,6 +8,7 @@ import os
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -77,6 +78,8 @@ _T = TypeVar("_T")
 _LINE_LIMIT = 16 * 1024 * 1024
 _STDERR_LIMIT = 8 * 1024
 _REAP_WAIT_TIMEOUT = 0.5
+_REAP_RETRY_TIMEOUT = 0.5
+_REAP_RETRY_INTERVAL = 0.005
 
 
 async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
@@ -84,17 +87,27 @@ async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except PermissionError as error:
-            # Darwin can reject a zombie-only group before the child watcher
-            # reaps its exited leader. Wait briefly for that reaping, then
-            # retry so descendants still receive the signal. A live process
-            # keeps the original permission failure visible.
+            # Darwin can reject a zombie-only group while our exited leader
+            # or an orphaned descendant waits to be reaped. Wait briefly to
+            # reap our leader, then retry until the group vanishes or a live
+            # descendant is signalled. A live leader or persistent EPERM
+            # stays visible.
             try:
                 await asyncio.wait_for(
                     asyncio.shield(process.wait()), timeout=_REAP_WAIT_TIMEOUT
                 )
             except asyncio.TimeoutError as timeout:
                 raise error from timeout
-            os.killpg(process.pid, signal.SIGKILL)
+            deadline = time.monotonic() + _REAP_RETRY_TIMEOUT
+            while True:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    return
+                except PermissionError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    await asyncio.sleep(min(_REAP_RETRY_INTERVAL, remaining))
     except ProcessLookupError:
         pass
 
